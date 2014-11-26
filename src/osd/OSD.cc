@@ -5889,7 +5889,7 @@ void OSD::sched_scrub()
 
       PG *pg = _lookup_lock_pg(pgid);
       if (pg) {
-	if (pg->get_pgbackend()->scrub_supported() && pg->is_active() &&
+	if (pg->get_pgbackend()->scrub_supported() && pg->is_peered() &&
 	    (load_is_low ||
 	     (double)diff >= cct->_conf->osd_scrub_max_interval ||
 	     pg->scrubber.must_scrub)) {
@@ -7784,7 +7784,7 @@ void OSD::do_recovery(PG *pg, ThreadPool::TPHandle &handle)
     return;
   } else {
     pg->lock_suspend_timeout(handle);
-    if (pg->deleting || !(pg->is_active() && pg->is_primary())) {
+    if (pg->deleting || !(pg->is_peered() && pg->is_primary())) {
       pg->unlock();
       goto out;
     }
