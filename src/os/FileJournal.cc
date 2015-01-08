@@ -776,7 +776,7 @@ int FileJournal::prepare_multi_write(bufferlist& bl, uint64_t& orig_ops, uint64_
   int eleft = g_conf->journal_max_write_entries;
   unsigned bmax = g_conf->journal_max_write_bytes;
 
-  if (full_state != FULL_NOTFULL)
+  if (!writeq_empty() && full_state != FULL_NOTFULL)
     return -ENOSPC;
   
   while (!writeq_empty()) {
