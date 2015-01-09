@@ -636,6 +636,9 @@ void FileJournal::stop_writer()
     Mutex::Locker p(writeq_lock);
     write_stop = true;
     writeq_cond.Signal();
+    // Doesn't hurt to signal commit_cond in case thread is waiting there
+    // and caller didn't use committed_thru() first.
+    commit_cond.Signal();
   }
   write_thread.join();
 
@@ -776,7 +779,7 @@ int FileJournal::prepare_multi_write(bufferlist& bl, uint64_t& orig_ops, uint64_
   int eleft = g_conf->journal_max_write_entries;
   unsigned bmax = g_conf->journal_max_write_bytes;
 
-  if (!writeq_empty() && full_state != FULL_NOTFULL)
+  if (full_state != FULL_NOTFULL)
     return -ENOSPC;
   
   while (!writeq_empty()) {
@@ -1181,11 +1184,22 @@ void FileJournal::write_thread_entry()
 
     bufferlist bl;
     int r = prepare_multi_write(bl, orig_ops, orig_bytes);
+    // Don't care about journal full if nothing in queue
+    // to let header get written and wait above for shutdown
     if (r == -ENOSPC) {
-      dout(20) << "write_thread_entry full, going to sleep (waiting for commit)" << dendl;
-      commit_cond.Wait(write_lock);
-      dout(20) << "write_thread_entry woke up" << dendl;
-      continue;
+      if (write_stop) {
+	dout(20) << "write_thread_entry full and stopping, throw out queue and finish up" << dendl;
+	while (!writeq_empty()) {
+	  put_throttle(1, peek_write().bl.length());
+	  pop_write();
+	}  
+	print_header();
+      } else {
+	dout(20) << "write_thread_entry full, going to sleep (waiting for commit)" << dendl;
+	commit_cond.Wait(write_lock);
+	dout(20) << "write_thread_entry woke up" << dendl;
+	continue;
+      }
     }
     assert(r == 0);
 
