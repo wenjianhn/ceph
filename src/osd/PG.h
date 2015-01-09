@@ -395,6 +395,44 @@ public:
       assert(needs_recovery(hoid));
       needs_recovery_map[hoid].need = need;
     }
+    void rebuild_object_location(
+      const hobject_t &hoid,
+      const set<pg_shard_t> &actingbackfill,
+      const map<pg_shard_t, const pg_missing_t *> &all_missing,
+      const map<pg_shard_t, const pg_info_t *> &all_info) {
+      needs_recovery_map.erase(hoid);
+      missing_loc.erase(hoid);
+      eversion_t need;
+      for (set<pg_shard_t>::const_iterator peer = actingbackfill.begin();
+	   peer != actingbackfill.end();
+	   ++peer) {
+	map<pg_shard_t, const pg_missing_t *>::const_iterator pm =
+	  all_missing.find(*peer);
+	assert(pm != all_missing.end());
+	if (pm->second->is_missing(hoid)) {
+	  need = pm->second->missing.find(hoid)->second.need;
+	  break;
+	}
+      }
+      if (need == eversion_t())
+	return;
+
+      set<pg_shard_t> have;
+      for (map<pg_shard_t, const pg_missing_t *>::const_iterator pm =
+	     all_missing.begin();
+	   pm != all_missing.end();
+	   ++pm) {
+	map<pg_shard_t, const pg_info_t *>::const_iterator pi =
+	  all_info.find(pm->first);
+	assert(pi != all_info.end());
+	if (pi->second->last_update >= need &&
+	    !pm->second->is_missing(hoid)) {
+	  have.insert(pm->first);
+	}
+      }
+      missing_loc[hoid].swap(have);
+      add_missing(hoid, need, eversion_t());
+    }
 
     /// Adds info about a possible recovery source
     bool add_source_info(
@@ -729,8 +767,12 @@ protected:
   // pg waiters
   unsigned flushes_in_progress;
 
-  // Ops waiting on backfill_pos to change
+  // ops waiting on peered
+  list<OpRequestRef>            waiting_for_peered;
+
+  // ops waiting on active (require peered as well)
   list<OpRequestRef>            waiting_for_active;
+
   list<OpRequestRef>            waiting_for_cache_not_full;
   list<OpRequestRef>            waiting_for_all_missing;
   map<hobject_t, list<OpRequestRef> > waiting_for_unreadable_object,
@@ -966,13 +1008,13 @@ public:
   void replay_queued_ops();
   void activate(
     ObjectStore::Transaction& t,
-    epoch_t query_epoch,
+    epoch_t activation_epoch,
     list<Context*>& tfin,
     map<int, map<spg_t,pg_query_t> >& query_map,
     map<int,
       vector<pair<pg_notify_t, pg_interval_map_t> > > *activator_map,
     RecoveryCtx *ctx);
-  void _activate_committed(epoch_t e);
+  void _activate_committed(epoch_t epoch, epoch_t activation_epoch);
   void all_activated_and_committed();
 
   void proc_primary_info(ObjectStore::Transaction &t, const pg_info_t &info);
@@ -1366,11 +1408,11 @@ public:
     }
   };
   struct Activate : boost::statechart::event< Activate > {
-    epoch_t query_epoch;
+    epoch_t activation_epoch;
     Activate(epoch_t q) : boost::statechart::event< Activate >(),
-			  query_epoch(q) {}
+			  activation_epoch(q) {}
     void print(std::ostream *out) const {
-      *out << "Activate from " << query_epoch;
+      *out << "Activate from " << activation_epoch;
     }
   };
   struct RequestBackfillPrio : boost::statechart::event< RequestBackfillPrio > {
@@ -2081,6 +2123,9 @@ public:
   bool       is_undersized() const { return state_test(PG_STATE_UNDERSIZED); }
 
   bool       is_scrubbing() const { return state_test(PG_STATE_SCRUBBING); }
+  bool       is_peered() const {
+    return state_test(PG_STATE_ACTIVE) || state_test(PG_STATE_PEERED);
+  }
 
   bool  is_empty() const { return info.last_update == eversion_t(0,0); }
 
@@ -2121,9 +2166,9 @@ public:
     return at_version;
   }
 
-  void add_log_entry(pg_log_entry_t& e, bufferlist& log_bl);
+  void add_log_entry(const pg_log_entry_t& e, bufferlist& log_bl);
   void append_log(
-    vector<pg_log_entry_t>& logv,
+    const vector<pg_log_entry_t>& logv,
     eversion_t trim_to,
     eversion_t trim_rollback_to,
     ObjectStore::Transaction &t,
@@ -2140,7 +2185,7 @@ public:
   static bool _has_removal_flag(ObjectStore *store, spg_t pgid);
   static epoch_t peek_map_epoch(ObjectStore *store, spg_t pgid, bufferlist *bl);
   void update_snap_map(
-    vector<pg_log_entry_t> &log_entries,
+    const vector<pg_log_entry_t> &log_entries,
     ObjectStore::Transaction& t);
 
   void filter_snapc(vector<snapid_t> &snaps);

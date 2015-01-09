@@ -264,6 +264,10 @@ void ReplicatedPG::on_local_recover(
     assert(obc);
     obc->obs.exists = true;
     obc->ondisk_write_lock();
+
+    assert(obc->get_recovery_read());
+    assert(recovering.count(obc->obs.oi.soid));
+    recovering[obc->obs.oi.soid] = obc;
     obc->obs.oi = recovery_info.oi;  // may have been updated above
 
 
@@ -309,12 +313,17 @@ void ReplicatedPG::on_global_recover(
   dout(10) << "pushed " << soid << " to all replicas" << dendl;
   map<hobject_t, ObjectContextRef>::iterator i = recovering.find(soid);
   assert(i != recovering.end());
-  if (backfills_in_flight.count(soid)) {
-    list<OpRequestRef> requeue_list;
-    i->second->drop_backfill_read(&requeue_list);
-    requeue_ops(requeue_list);
+
+  // recover missing won't have had an obc, but it gets filled in
+  // during on_local_recover
+  assert(i->second);
+  list<OpRequestRef> requeue_list;
+  i->second->drop_recovery_read(&requeue_list);
+  requeue_ops(requeue_list);
+
+  if (backfills_in_flight.count(soid))
     backfills_in_flight.erase(soid);
-  }
+
   recovering.erase(i);
   finish_recovery_op(soid);
   if (waiting_for_degraded_object.count(soid)) {
@@ -1267,28 +1276,33 @@ void ReplicatedPG::do_request(
     dout(20) << flushes_in_progress
 	     << " flushes_in_progress pending "
 	     << "waiting for active on " << op << dendl;
-    waiting_for_active.push_back(op);
+    waiting_for_peered.push_back(op);
     return;
   }
 
-  if (!is_active()) {
+  if (!is_peered()) {
     // Delay unless PGBackend says it's ok
     if (pgbackend->can_handle_while_inactive(op)) {
       bool handled = pgbackend->handle_message(op);
       assert(handled);
       return;
     } else {
-      waiting_for_active.push_back(op);
+      waiting_for_peered.push_back(op);
       return;
     }
   }
 
-  assert(is_active() && flushes_in_progress == 0);
+  assert(is_peered() && flushes_in_progress == 0);
   if (pgbackend->handle_message(op))
     return;
 
   switch (op->get_req()->get_type()) {
   case CEPH_MSG_OSD_OP:
+    if (!is_active()) {
+      dout(20) << " peered, not active, waiting for active on " << op << dendl;
+      waiting_for_active.push_back(op);
+      return;
+    }
     if (is_replay()) {
       dout(20) << " replay, waiting for active on " << op << dendl;
       waiting_for_active.push_back(op);
@@ -1415,12 +1429,6 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   // missing object?
   if (is_unreadable_object(head)) {
     wait_for_unreadable_object(head, op);
-    return;
-  }
-
-  // degraded object?
-  if (write_ordered && is_degraded_object(head)) {
-    wait_for_degraded_object(head, op);
     return;
   }
 
@@ -2223,8 +2231,8 @@ void ReplicatedPG::do_sub_op(OpRequestRef op)
     first = &m->ops[0];
   }
 
-  if (!is_active()) {
-    waiting_for_active.push_back(op);
+  if (!is_peered()) {
+    waiting_for_peered.push_back(op);
     op->mark_delayed("waiting for active");
     return;
   }
@@ -7336,6 +7344,40 @@ void ReplicatedPG::issue_repop(RepGather *repop, utime_t now)
     repop->ctx->reqid,
     repop->ctx->op);
   repop->ctx->op_t = NULL;
+
+  if (is_degraded_object(soid)) {
+    dout(10) << __func__ << ": " << soid
+	     << " degraded, maintaining missing sets"
+	     << dendl;
+    assert(!is_missing_object(soid));
+    for (vector<pg_log_entry_t>::iterator j = repop->ctx->log.begin();
+	 j != repop->ctx->log.end();
+	 ++j) {
+      for (set<pg_shard_t>::const_iterator peer = actingbackfill.begin();
+	   peer != actingbackfill.end();
+	   ++peer) {
+	if (*peer == pg_whoami) {
+	  assert(!is_missing_object(j->soid));
+	  continue;
+	}
+	map<pg_shard_t, pg_missing_t>::iterator pm = peer_missing.find(*peer);
+	assert(pm != peer_missing.end());
+	if (!pm->second.is_missing(soid)) {
+	  assert(!pm->second.is_missing(j->soid));
+	  continue;
+	}
+	dout(10) << __func__ << ": " << soid << " missing on "
+		 << *peer << ", adding event " << *j << " to missing"
+		 << dendl;
+	pm->second.add_next_event(*j);
+      }
+      missing_loc.rebuild_object_location(
+	j->soid,
+	actingbackfill,
+	get_all_missing(),
+	get_all_info());
+    }
+  }
 }
 
 template<typename T, int MSGTYPE>
@@ -7348,7 +7390,7 @@ Message * ReplicatedBackend::generate_subop(
   eversion_t pg_trim_rollback_to,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
-  vector<pg_log_entry_t> &log_entries,
+  const vector<pg_log_entry_t> &log_entries,
   boost::optional<pg_hit_set_history_t> &hset_hist,
   InProgressOp *op,
   ObjectStore::Transaction *op_t,
@@ -7403,7 +7445,7 @@ void ReplicatedBackend::issue_op(
   eversion_t pg_trim_rollback_to,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
-  vector<pg_log_entry_t> &log_entries,
+  const vector<pg_log_entry_t> &log_entries,
   boost::optional<pg_hit_set_history_t> &hset_hist,
   InProgressOp *op,
   ObjectStore::Transaction *op_t)
@@ -7707,7 +7749,8 @@ ObjectContextRef ReplicatedPG::create_object_context(const object_info_t& oi,
   if (ssc)
     register_snapset_context(ssc);
   dout(10) << "create_object_context " << (void*)obc.get() << " " << oi.soid << " " << dendl;
-  populate_obc_watchers(obc);
+  if (is_active())
+    populate_obc_watchers(obc);
   return obc;
 }
 
@@ -7772,7 +7815,8 @@ ObjectContextRef ReplicatedPG::get_object_context(const hobject_t& soid,
       soid, true,
       soid.has_snapset() ? attrs : 0);
 
-    populate_obc_watchers(obc);
+    if (is_active())
+      populate_obc_watchers(obc);
 
     if (pool.info.require_rollback()) {
       if (attrs) {
@@ -8203,9 +8247,6 @@ void ReplicatedBackend::sub_op_modify_impl(OpRequestRef op)
   // sanity checks
   assert(m->map_epoch >= get_info().history.same_interval_since);
   
-  // we better not be missing this.
-  assert(!parent->get_log().get_missing().is_missing(soid));
-
   int ackerosd = m->get_source().num();
   
   op->mark_started();
@@ -9967,9 +10008,9 @@ void ReplicatedPG::on_flushed()
   assert(flushes_in_progress > 0);
   flushes_in_progress--;
   if (flushes_in_progress == 0) {
-    requeue_ops(waiting_for_active);
+    requeue_ops(waiting_for_peered);
   }
-  if (!is_active() || !is_primary()) {
+  if (!is_peered() || !is_primary()) {
     pair<hobject_t, ObjectContextRef> i;
     while (object_contexts.get_next(i.first, &i)) {
       derr << "on_flushed: object " << i.first << " obc still alive" << dendl;
@@ -10091,7 +10132,11 @@ void ReplicatedPG::on_change(ObjectStore::Transaction *t)
   // requeue everything in the reverse order they should be
   // reexamined.
 
+  requeue_ops(waiting_for_peered);
+
   clear_scrub_reserved();
+
+  // requeues waiting_for_active
   scrub_clear_state();
 
   context_registry_on_change();
@@ -10188,18 +10233,25 @@ void ReplicatedPG::_clear_recovery_state()
   recovering_oids.clear();
 #endif
   last_backfill_started = hobject_t();
-  list<OpRequestRef> blocked_ops;
   set<hobject_t>::iterator i = backfills_in_flight.begin();
   while (i != backfills_in_flight.end()) {
     assert(recovering.count(*i));
-    recovering[*i]->drop_backfill_read(&blocked_ops);
-    requeue_ops(blocked_ops);
     backfills_in_flight.erase(i++);
+  }
+
+  list<OpRequestRef> blocked_ops;
+  for (map<hobject_t, ObjectContextRef>::iterator i = recovering.begin();
+       i != recovering.end();
+       recovering.erase(i++)) {
+    if (i->second) {
+      i->second->drop_recovery_read(&blocked_ops);
+      requeue_ops(blocked_ops);
+    }
   }
   assert(backfills_in_flight.empty());
   pending_backfill_updates.clear();
-  recovering.clear();
-  pgbackend->clear_state();
+  assert(recovering.empty());
+  pgbackend->clear_recovery_state();
 }
 
 void ReplicatedPG::cancel_pull(const hobject_t &soid)
@@ -10622,6 +10674,15 @@ int ReplicatedPG::prep_object_replica_pushes(
     return 0;
   }
 
+  if (!obc->get_recovery_read()) {
+    dout(20) << "recovery delayed on " << soid
+	     << "; could not get rw_manager lock" << dendl;
+    return 0;
+  } else {
+    dout(20) << "recovery got recovery read lock on " << soid
+	     << dendl;
+  }
+
   start_recovery_op(soid);
   assert(!recovering.count(soid));
   recovering.insert(make_pair(soid, obc));
@@ -10989,7 +11050,7 @@ int ReplicatedPG::recover_backfill(
       if (!need_ver_targs.empty() || !missing_targs.empty()) {
 	ObjectContextRef obc = get_object_context(backfill_info.begin, false);
 	assert(obc);
-	if (obc->get_backfill_read()) {
+	if (obc->get_recovery_read()) {
 	  if (!need_ver_targs.empty()) {
 	    dout(20) << " BACKFILL replacing " << check
 		   << " with ver " << obj_v
