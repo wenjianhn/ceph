@@ -41,6 +41,8 @@ using namespace std;
 #include "global/global_init.h"
 #include "global/signal_handler.h"
 
+#include "perfglue/heap_profiler.h"
+
 #include "include/assert.h"
 
 #include "erasure-code/ErasureCodePlugin.h"
@@ -257,6 +259,7 @@ int main(int argc, const char **argv)
 
   global_init(&def_args, args,
               CEPH_ENTITY_TYPE_MON, CODE_ENVIRONMENT_DAEMON, flags);
+  ceph_heap_profiler_init();
 
   uuid_d fsid;
   std::string val;
@@ -469,6 +472,26 @@ int main(int argc, const char **argv)
     exit(1);
   }
 
+  {
+    // check fs stats. don't start if it's critically close to full.
+    ceph_data_stats_t stats;
+    int err = get_fs_stats(stats, g_conf->mon_data.c_str());
+    if (err < 0) {
+      cerr << "error checking monitor data's fs stats: " << cpp_strerror(err)
+           << std::endl;
+      exit(-err);
+    }
+    if (stats.avail_percent <= g_conf->mon_data_avail_crit) {
+      cerr << "error: monitor data filesystem reached concerning levels of"
+           << " available storage space (available: "
+           << stats.avail_percent << "% " << prettybyte_t(stats.byte_avail)
+           << ")\nyou may adjust 'mon data avail crit' to a lower value"
+           << " to make this go away (default: " << g_conf->mon_data_avail_crit
+           << "%)\n" << std::endl;
+      exit(ENOSPC);
+    }
+  }
+
   // we fork early to prevent leveldb's environment static state from
   // screwing us over
   Preforker prefork;
@@ -662,7 +685,7 @@ int main(int argc, const char **argv)
 
   // bind
   int rank = monmap.get_rank(g_conf->name.get_id());
-  Messenger *messenger = Messenger::create(g_ceph_context,
+  Messenger *messenger = Messenger::create(g_ceph_context, g_conf->ms_type,
 					   entity_name_t::MON(rank),
 					   "mon",
 					   0);

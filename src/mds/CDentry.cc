@@ -137,7 +137,7 @@ inodeno_t CDentry::get_ino()
 }
 */
 
-pair<int,int> CDentry::authority()
+mds_authority_t CDentry::authority()
 {
   return dir->authority();
 }
@@ -540,6 +540,12 @@ void CDentry::remove_client_lease(ClientLease *l, Locker *locker)
 
   if (gather)
     locker->eval_gather(&lock);
+}
+
+void CDentry::remove_client_leases(Locker *locker)
+{
+  while (!client_lease_map.empty())
+    remove_client_lease(client_lease_map.begin()->second, locker);
 }
 
 void CDentry::_put()

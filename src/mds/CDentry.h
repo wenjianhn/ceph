@@ -32,7 +32,7 @@
 
 class CInode;
 class CDir;
-
+class Locker;
 class Message;
 class CDentry;
 class LogSegment;
@@ -283,7 +283,7 @@ public:
   version_t get_projected_version() { return projected_version; }
   void set_projected_version(version_t v) { projected_version = v; }
   
-  pair<int,int> authority();
+  mds_authority_t authority();
 
   version_t pre_dirty(version_t min=0);
   void _mark_dirty(LogSegment *ls);
@@ -295,7 +295,7 @@ public:
   void clear_new() { state_clear(STATE_NEW); }
   
   // -- replication
-  void encode_replica(int mds, bufferlist& bl) {
+  void encode_replica(mds_rank_t mds, bufferlist& bl) {
     if (!is_replicated())
       lock.replicate_relax();
 
@@ -383,8 +383,8 @@ public:
   }
 
   ClientLease *add_client_lease(client_t c, Session *session);
-  void remove_client_lease(ClientLease *r, class Locker *locker);  // returns remaining mask (if any), and kicks locker eval_gathers
-  
+  void remove_client_lease(ClientLease *r, Locker *locker);  // returns remaining mask (if any), and kicks locker eval_gathers
+  void remove_client_leases(Locker *locker);
 
   
   ostream& print_db_line_prefix(ostream& out);

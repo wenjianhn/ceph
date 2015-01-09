@@ -4,6 +4,9 @@
 #include "mdstypes.h"
 #include "common/Formatter.h"
 
+const mds_gid_t MDS_GID_NONE = mds_gid_t(0);
+const mds_rank_t MDS_RANK_NONE = mds_rank_t(-1);
+
 void dump(const ceph_file_layout& l, Formatter *f)
 {
   f->dump_unsigned("stripe_unit", l.fl_stripe_unit);
@@ -155,6 +158,31 @@ ostream& operator<<(ostream &out, const nest_info_t &n)
   return out;
 }
 
+/*
+ * quota_info_t
+ */
+void quota_info_t::dump(Formatter *f) const
+{
+  f->dump_int("max_bytes", max_bytes);
+  f->dump_int("max_files", max_files);
+}
+
+void quota_info_t::generate_test_instances(list<quota_info_t *>& ls)
+{
+  ls.push_back(new quota_info_t);
+  ls.push_back(new quota_info_t);
+  ls.back()->max_bytes = 16;
+  ls.back()->max_files = 16;
+}
+
+ostream& operator<<(ostream &out, const quota_info_t &n)
+{
+  out << "quota("
+      << "max_bytes = " << n.max_bytes
+      << " max_files = " << n.max_files
+      << ")";
+  return out;
+}
 
 /*
  * client_writeable_range_t
@@ -207,7 +235,7 @@ ostream& operator<<(ostream& out, const client_writeable_range_t& r)
  */
 void inode_t::encode(bufferlist &bl) const
 {
-  ENCODE_START(10, 6, bl);
+  ENCODE_START(11, 6, bl);
 
   ::encode(ino, bl);
   ::encode(rdev, bl);
@@ -249,12 +277,14 @@ void inode_t::encode(bufferlist &bl) const
   ::encode(inline_version, bl);
   ::encode(inline_data, bl);
 
+  ::encode(quota, bl);
+
   ENCODE_FINISH(bl);
 }
 
 void inode_t::decode(bufferlist::iterator &p)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(10, 6, 6, p);
+  DECODE_START_LEGACY_COMPAT_LEN(11, 6, 6, p);
 
   ::decode(ino, p);
   ::decode(rdev, p);
@@ -317,6 +347,8 @@ void inode_t::decode(bufferlist::iterator &p)
   }
   if (struct_v < 10)
     backtrace_version = 0; // force update backtrace
+  if (struct_v >= 11)
+    ::decode(quota, p);
 
   DECODE_FINISH(p);
 }
@@ -390,6 +422,67 @@ void inode_t::generate_test_instances(list<inode_t*>& ls)
   // i am lazy.
 }
 
+int inode_t::compare(const inode_t &other, bool *divergent) const
+{
+  assert(ino == other.ino);
+  if (version == other.version) {
+    if (rdev != other.rdev ||
+        ctime != other.ctime ||
+        mode != other.mode ||
+        uid != other.uid ||
+        gid != other.gid ||
+        nlink != other.nlink ||
+        memcmp(&dir_layout, &other.dir_layout, sizeof(dir_layout)) ||
+        memcmp(&layout, &other.layout, sizeof(layout)) ||
+        old_pools != other.old_pools ||
+        size != other.size ||
+        max_size_ever != other.max_size_ever ||
+        truncate_seq != other.truncate_seq ||
+        truncate_size != other.truncate_size ||
+        truncate_from != other.truncate_from ||
+        truncate_pending != other.truncate_pending ||
+        mtime != other.mtime ||
+        atime != other.atime ||
+        time_warp_seq != other.time_warp_seq ||
+        !(*const_cast<bufferlist*>(&inline_data) ==
+            *const_cast<bufferlist*>(&other.inline_data)) ||
+        inline_version != other.inline_version ||
+        client_ranges != other.client_ranges ||
+        !(dirstat == other.dirstat) ||
+        !(rstat == other.rstat) ||
+        !(accounted_rstat == other.accounted_rstat) ||
+        file_data_version != other.file_data_version ||
+        xattr_version != other.xattr_version ||
+        backtrace_version != other.backtrace_version) {
+      *divergent = true;
+    }
+    return 0;
+  } else if (version > other.version) {
+    *divergent = !older_is_consistent(other);
+    return 1;
+  } else {
+    assert(version < other.version);
+    *divergent = !other.older_is_consistent(*this);
+    return -1;
+  }
+}
+
+bool inode_t::older_is_consistent(const inode_t &other) const
+{
+  if (max_size_ever < other.max_size_ever ||
+      truncate_seq < other.truncate_seq ||
+      time_warp_seq < other.time_warp_seq ||
+      inline_version < other.inline_version ||
+      dirstat.version < other.dirstat.version ||
+      rstat.version < other.rstat.version ||
+      accounted_rstat.version < other.accounted_rstat.version ||
+      file_data_version < other.file_data_version ||
+      xattr_version < other.xattr_version ||
+      backtrace_version < other.backtrace_version) {
+    return false;
+  }
+  return true;
+}
 
 /*
  * old_inode_t

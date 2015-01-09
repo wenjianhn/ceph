@@ -50,6 +50,11 @@ public:
   utime_t(const struct ceph_timespec &v) {
     decode_timeval(&v);
   }
+  utime_t(const struct timespec v)
+  {
+    tv.tv_sec = v.tv_sec;
+    tv.tv_nsec = v.tv_nsec;
+  }
   utime_t(const struct timeval &v) {
     set_from_timeval(&v);
   }
@@ -76,6 +81,9 @@ public:
 
   uint64_t to_nsec() const {
     return (uint64_t)tv.tv_nsec + (uint64_t)tv.tv_sec * 1000000000ull;
+  }
+  uint64_t to_msec() const {
+    return (uint64_t)tv.tv_nsec / 1000000ull + (uint64_t)tv.tv_sec * 1000ull;
   }
 
   void copy_to_timeval(struct timeval *v) const {

@@ -443,6 +443,9 @@ void ObjectStore::Transaction::dump(ceph::Formatter *f)
   f->close_section();
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 void ObjectStore::Transaction::generate_test_instances(list<ObjectStore::Transaction*>& o)
 {
   o.push_back(new Transaction);
@@ -480,13 +483,12 @@ void ObjectStore::Transaction::generate_test_instances(list<ObjectStore::Transac
   t->clone_range(c, o1, o2, 1, 12, 99);
 
   t->create_collection(c);
-  t->collection_add(c, c2, o1);
-  t->collection_add(c, c2, o2);
   t->collection_move(c, c2, o3);
   t->remove_collection(c);
-  t->collection_setattr(c, "this", bl);
-  t->collection_rmattr(c, "foo");
+  t->collection_setattr(c, string("this"), bl);
+  t->collection_rmattr(c, string("foo"));
   t->collection_setattrs(c, m);
-  t->collection_rename(c, c2);
   o.push_back(t);  
 }
+
+#pragma GCC diagnostic pop

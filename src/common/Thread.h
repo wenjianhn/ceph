@@ -42,7 +42,8 @@ class Thread {
 
  public:
   const pthread_t &get_thread_id();
-  bool is_started();
+  pid_t get_pid() const { return pid; }
+  bool is_started() const;
   bool am_self();
   int kill(int signal);
   int try_create(size_t stacksize);

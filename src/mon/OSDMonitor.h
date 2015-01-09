@@ -224,6 +224,8 @@ private:
 
   bool check_source(PaxosServiceMessage *m, uuid_d fsid);
  
+  bool preprocess_get_osdmap(class MMonGetOSDMap *m);
+
   bool preprocess_mark_me_down(class MOSDMarkMeDown *m);
 
   friend class C_AckMarkedDown;
@@ -261,10 +263,16 @@ private:
   bool prepare_pool_op (MPoolOp *m);
   bool prepare_pool_op_create (MPoolOp *m);
   bool prepare_pool_op_delete(MPoolOp *m);
+  int crush_rename_bucket(const string& srcname,
+			  const string& dstname,
+			  ostream *ss);
   int crush_ruleset_create_erasure(const string &name,
 				   const string &profile,
 				   int *ruleset,
 				   stringstream &ss);
+  int get_crush_ruleset(const string &ruleset_name,
+			int *crush_ruleset,
+			stringstream &ss);
   int get_erasure_code(const string &erasure_code_profile,
 		       ErasureCodeInterfaceRef *erasure_code,
 		       stringstream &ss) const;

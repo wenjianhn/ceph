@@ -24,7 +24,6 @@
 #include "common/admin_socket.h"
 #include "common/Timer.h"
 #include "common/RWLock.h"
-#include "include/rados/rados_types.h"
 #include "include/rados/rados_types.hpp"
 
 #include <list>
@@ -38,12 +37,14 @@ class Messenger;
 class OSDMap;
 class MonClient;
 class Message;
+class Finisher;
 
 class MPoolOpReply;
 
 class MGetPoolStatsReply;
 class MStatfsReply;
 class MCommandReply;
+class MWatchNotify;
 
 class PerfCounters;
 
@@ -170,14 +171,6 @@ struct ObjectOperation {
     osd_op.indata.append(method, osd_op.op.cls.method_len);
     osd_op.indata.append(indata);
   }
-  void add_watch(int op, uint64_t cookie, uint64_t ver, uint8_t flag, bufferlist& inbl) {
-    OSDOp& osd_op = add_op(op);
-    osd_op.op.op = op;
-    osd_op.op.watch.cookie = cookie;
-    osd_op.op.watch.ver = ver;
-    osd_op.op.watch.flag = flag;
-    osd_op.indata.append(inbl);
-  }
   void add_pgls(int op, uint64_t count, collection_list_handle_t cookie, epoch_t start_epoch) {
     OSDOp& osd_op = add_op(op);
     osd_op.op.op = op;
@@ -216,14 +209,17 @@ struct ObjectOperation {
     flags |= CEPH_OSD_FLAG_PGOP;
   }
 
+  void pg_nls(uint64_t count, bufferlist& filter, collection_list_handle_t cookie, epoch_t start_epoch) {
+    if (filter.length() == 0)
+      add_pgls(CEPH_OSD_OP_PGNLS, count, cookie, start_epoch);
+    else
+      add_pgls_filter(CEPH_OSD_OP_PGNLS_FILTER, count, filter, cookie, start_epoch);
+    flags |= CEPH_OSD_FLAG_PGOP;
+  }
+
   void create(bool excl) {
     OSDOp& o = add_op(CEPH_OSD_OP_CREATE);
     o.op.flags = (excl ? CEPH_OSD_OP_FLAG_EXCL : 0);
-  }
-  void create(bool excl, const string& category) {
-    OSDOp& o = add_op(CEPH_OSD_OP_CREATE);
-    o.op.flags = (excl ? CEPH_OSD_OP_FLAG_EXCL : 0);
-    ::encode(category, o.indata);
   }
 
   struct C_ObjectOperation_stat : public Context {
@@ -622,7 +618,6 @@ struct ObjectOperation {
     object_copy_cursor_t *cursor;
     uint64_t *out_size;
     utime_t *out_mtime;
-    string *out_category;
     std::map<std::string,bufferlist> *out_attrs;
     bufferlist *out_data, *out_omap_header;
     std::map<std::string,bufferlist> *out_omap;
@@ -632,7 +627,6 @@ struct ObjectOperation {
     C_ObjectOperation_copyget(object_copy_cursor_t *c,
 			      uint64_t *s,
 			      utime_t *m,
-			      string *cat,
 			      std::map<std::string,bufferlist> *a,
 			      bufferlist *d, bufferlist *oh,
 			      std::map<std::string,bufferlist> *o,
@@ -640,7 +634,7 @@ struct ObjectOperation {
 			      snapid_t *osnap_seq,
 			      int *r)
       : cursor(c),
-	out_size(s), out_mtime(m), out_category(cat),
+	out_size(s), out_mtime(m),
 	out_attrs(a), out_data(d), out_omap_header(oh),
 	out_omap(o), out_snaps(osnaps), out_snap_seq(osnap_seq),
 	prval(r) {}
@@ -655,8 +649,6 @@ struct ObjectOperation {
 	  *out_size = copy_reply.size;
 	if (out_mtime)
 	  *out_mtime = copy_reply.mtime;
-	if (out_category)
-	  *out_category = copy_reply.category;
 	if (out_attrs)
 	  *out_attrs = copy_reply.attrs;
 	if (out_data)
@@ -681,7 +673,6 @@ struct ObjectOperation {
 		uint64_t max,
 		uint64_t *out_size,
 		utime_t *out_mtime,
-		string *out_category,
 		std::map<std::string,bufferlist> *out_attrs,
 		bufferlist *out_data,
 		bufferlist *out_omap_header,
@@ -696,7 +687,7 @@ struct ObjectOperation {
     unsigned p = ops.size() - 1;
     out_rval[p] = prval;
     C_ObjectOperation_copyget *h =
-      new C_ObjectOperation_copyget(cursor, out_size, out_mtime, out_category,
+      new C_ObjectOperation_copyget(cursor, out_size, out_mtime,
                                     out_attrs, out_data, out_omap_header,
 				    out_omap, out_snaps, out_snap_seq, prval);
     out_bl[p] = &h->bl;
@@ -856,20 +847,26 @@ struct ObjectOperation {
   }
 
   // watch/notify
-  void watch(uint64_t cookie, uint64_t ver, bool set) {
-    bufferlist inbl;
-    add_watch(CEPH_OSD_OP_WATCH, cookie, ver, (set ? 1 : 0), inbl);
+  void watch(uint64_t cookie, __u8 op) {
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_WATCH);
+    osd_op.op.watch.cookie = cookie;
+    osd_op.op.watch.op = op;
   }
 
-  void notify(uint64_t cookie, uint64_t ver, bufferlist& inbl) {
-    add_watch(CEPH_OSD_OP_NOTIFY, cookie, ver, 1, inbl); 
+  void notify(uint64_t cookie, bufferlist& inbl) {
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_NOTIFY);
+    osd_op.op.notify.cookie = cookie;
+    osd_op.indata.append(inbl);
   }
 
-  void notify_ack(uint64_t notify_id, uint64_t ver, uint64_t cookie) {
+  void notify_ack(uint64_t notify_id, uint64_t cookie,
+		  bufferlist& reply_bl) {
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_NOTIFY_ACK);
     bufferlist bl;
     ::encode(notify_id, bl);
     ::encode(cookie, bl);
-    add_watch(CEPH_OSD_OP_NOTIFY_ACK, notify_id, ver, 0, bl);
+    ::encode(reply_bl, bl);
+    osd_op.indata.append(bl);
   }
 
   void list_watchers(list<obj_watch_t> *out,
@@ -902,8 +899,8 @@ struct ObjectOperation {
     osd_op.op.assert_ver.ver = ver;
   }
   void assert_src_version(const object_t& srcoid, snapid_t srcsnapid, uint64_t ver) {
-    bufferlist bl;
-    add_watch(CEPH_OSD_OP_ASSERT_SRC_VERSION, 0, ver, 0, bl);
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_ASSERT_SRC_VERSION);
+    osd_op.op.assert_ver.ver = ver;
     ops.rbegin()->soid = sobject_t(srcoid, srcsnapid);
   }
 
@@ -1006,6 +1003,7 @@ public:
 public:
   Messenger *messenger;
   MonClient *monc;
+  Finisher *finisher;
 private:
   OSDMap    *osdmap;
 public:
@@ -1029,13 +1027,14 @@ public:
   void maybe_request_map();
 private:
 
-  int _maybe_request_map();
+  void _maybe_request_map();
 
   version_t last_seen_osdmap_version;
   version_t last_seen_pgmap_version;
 
   RWLock rwlock;
-  RWTimer timer;
+  Mutex timer_lock;
+  SafeTimer timer;
 
   PerfCounters *logger;
   
@@ -1077,8 +1076,12 @@ public:
     pg_t base_pgid;      ///< explciti pg target, if any
 
     pg_t pgid;           ///< last pg we mapped to
-    vector<int> acting;  ///< acting for last pg we mapped to
-    int primary;         ///< primary for last pg we mapped to
+    unsigned pg_num;     ///< last pg_num we mapped to
+    vector<int> up;      ///< set of up osds for last pg we mapped to
+    vector<int> acting;  ///< set of acting osds for last pg we mapped to
+    int up_primary;      ///< primary for last pg we mapped to based on the up set
+    int acting_primary;  ///< primary for last pg we mapped to based on the acting set
+    int min_size;        ///< the min size of the pool when were were last mapped
 
     bool used_replica;
     bool paused;
@@ -1090,7 +1093,10 @@ public:
 	base_oid(oid),
 	base_oloc(oloc),
 	precalc_pgid(false),
-	primary(-1),
+	pg_num(0),
+	up_primary(-1),
+	acting_primary(-1),
+	min_size(-1),
 	used_replica(false),
 	paused(false),
 	osd(-1)
@@ -1137,6 +1143,11 @@ public:
     /// true if we should resend this message on failure
     bool should_resend;
 
+    /// true if the throttle budget is get/put on a series of OPs, instead of
+    /// per OP basis, when this flag is set, the budget is acquired before sending
+    /// the very first OP of the series and released upon receiving the last OP reply.
+    bool ctx_budgeted;
+
     Op(const object_t& o, const object_locator_t& ol, vector<OSDOp>& op,
        int f, Context *ac, Context *co, version_t *ov) :
       session(NULL), incarnation(0),
@@ -1150,7 +1161,8 @@ public:
       objver(ov), reply_epoch(NULL),
       map_dne_bound(0),
       budgeted(false),
-      should_resend(true) {
+      should_resend(true),
+      ctx_budgeted(false) {
       ops.swap(op);
       
       /* initialize out_* to match op vector */
@@ -1235,6 +1247,71 @@ public:
 
 
   // Pools and statistics 
+  struct NListContext {
+    int current_pg;
+    collection_list_handle_t cookie;
+    epoch_t current_pg_epoch;
+    int starting_pg_num;
+    bool at_end_of_pool;
+    bool at_end_of_pg;
+
+    int64_t pool_id;
+    int pool_snap_seq;
+    int max_entries;
+    string nspace;
+
+    bufferlist bl;   // raw data read to here
+    std::list<librados::ListObjectImpl> list;
+
+    bufferlist filter;
+
+    bufferlist extra_info;
+
+    // The budget associated with this context, once it is set (>= 0),
+    // the budget is not get/released on OP basis, instead the budget
+    // is acquired before sending the first OP and released upon receiving
+    // the last op reply.
+    int ctx_budget;
+
+    NListContext() : current_pg(0), current_pg_epoch(0), starting_pg_num(0),
+		    at_end_of_pool(false),
+		    at_end_of_pg(false),
+		    pool_id(0),
+		    pool_snap_seq(0),
+                    max_entries(0),
+                    nspace(),
+                    bl(),
+                    list(),
+                    filter(),
+                    extra_info(),
+                    ctx_budget(-1) {}
+
+    bool at_end() const {
+      return at_end_of_pool;
+    }
+
+    uint32_t get_pg_hash_position() const {
+      return current_pg;
+    }
+  };
+
+  struct C_NList : public Context {
+    NListContext *list_context;
+    Context *final_finish;
+    Objecter *objecter;
+    epoch_t epoch;
+    C_NList(NListContext *lc, Context * finish, Objecter *ob) :
+      list_context(lc), final_finish(finish), objecter(ob), epoch(0) {}
+    void finish(int r) {
+      if (r >= 0) {
+        objecter->_nlist_reply(list_context, r, final_finish, epoch);
+      } else {
+        final_finish->complete(r);
+      }
+    }
+  };
+
+  // Old pgls context we still use for talking to older OSDs
   struct ListContext {
     int current_pg;
     collection_list_handle_t cookie;
@@ -1255,11 +1332,24 @@ public:
 
     bufferlist extra_info;
 
+    // The budget associated with this context, once it is set (>= 0),
+    // the budget is not get/released on OP basis, instead the budget
+    // is acquired before sending the first OP and released upon receiving
+    // the last op reply.
+    int ctx_budget;
+
     ListContext() : current_pg(0), current_pg_epoch(0), starting_pg_num(0),
 		    at_end_of_pool(false),
 		    at_end_of_pg(false),
 		    pool_id(0),
-		    pool_snap_seq(0), max_entries(0) {}
+		    pool_snap_seq(0),
+                    max_entries(0),
+                    nspace(),
+                    bl(),
+                    list(),
+                    filter(),
+                    extra_info(),
+                    ctx_budget(-1) {}
 
     bool at_end() const {
       return at_end_of_pool;
@@ -1357,6 +1447,16 @@ public:
 
   // -- lingering ops --
 
+  struct WatchContext {
+    // this simply mirrors librados WatchCtx2
+    virtual void handle_notify(uint64_t notify_id,
+			       uint64_t cookie,
+			       uint64_t notifier_id,
+			       bufferlist& bl) = 0;
+    virtual void handle_error(uint64_t cookie, int err) = 0;
+    virtual ~WatchContext() {}
+  };
+
   struct LingerOp : public RefCountedObject {
     uint64_t linger_id;
 
@@ -1371,44 +1471,86 @@ public:
     bufferlist *poutbl;
     version_t *pobjver;
 
+    bool is_watch;
+    utime_t watch_valid_thru; ///< send time for last acked ping
+    int last_error;  ///< error from last failed ping|reconnect, if any
+    RWLock watch_lock;
+
+    // queue of pending async operations, with the timestamp of
+    // when they were queued.
+    list<utime_t> watch_pending_async;
+
+    uint32_t register_gen;
     bool registered;
     bool canceled;
     Context *on_reg_ack, *on_reg_commit;
 
+    // we trigger these from an async finisher
+    Context *on_notify_finish;
+    bufferlist *notify_result_bl;
+
+    WatchContext *watch_context;
+
     OSDSession *session;
 
     ceph_tid_t register_tid;
+    ceph_tid_t ping_tid;
     epoch_t map_dne_bound;
+
+    void _queued_async() {
+      assert(watch_lock.is_locked());
+      watch_pending_async.push_back(ceph_clock_now(NULL));
+    }
+    void finished_async() {
+      RWLock::WLocker l(watch_lock);
+      assert(!watch_pending_async.empty());
+      watch_pending_async.pop_front();
+    }
 
     LingerOp() : linger_id(0),
 		 target(object_t(), object_locator_t(), 0),
 		 snap(CEPH_NOSNAP),
 		 poutbl(NULL), pobjver(NULL),
+		 is_watch(false),
+		 last_error(0),
+		 watch_lock("Objecter::LingerOp::watch_lock"),
+		 register_gen(0),
 		 registered(false),
 		 canceled(false),
 		 on_reg_ack(NULL), on_reg_commit(NULL),
+		 on_notify_finish(NULL),
+		 notify_result_bl(NULL),
+		 watch_context(NULL),
 		 session(NULL),
 		 register_tid(0),
+		 ping_tid(0),
 		 map_dne_bound(0) {}
 
     // no copy!
     const LingerOp &operator=(const LingerOp& r);
     LingerOp(const LingerOp& o);
+
+    uint64_t get_cookie() {
+      return reinterpret_cast<uint64_t>(this);
+    }
+
   private:
-    ~LingerOp() {}
+    ~LingerOp() {
+      delete watch_context;
+    }
   };
 
-  struct C_Linger_Ack : public Context {
+  struct C_Linger_Register : public Context {
     Objecter *objecter;
     LingerOp *info;
-    C_Linger_Ack(Objecter *o, LingerOp *l) : objecter(o), info(l) {
+    C_Linger_Register(Objecter *o, LingerOp *l) : objecter(o), info(l) {
       info->get();
     }
-    ~C_Linger_Ack() {
+    ~C_Linger_Register() {
       info->put();
     }
     void finish(int r) {
-      objecter->_linger_ack(info, r);
+      objecter->_linger_register(info, r);
     }
   };
   
@@ -1423,6 +1565,37 @@ public:
     }
     void finish(int r) {
       objecter->_linger_commit(info, r);
+    }
+  };
+
+  struct C_Linger_Reconnect : public Context {
+    Objecter *objecter;
+    LingerOp *info;
+    C_Linger_Reconnect(Objecter *o, LingerOp *l) : objecter(o), info(l) {
+      info->get();
+    }
+    ~C_Linger_Reconnect() {
+      info->put();
+    }
+    void finish(int r) {
+      objecter->_linger_reconnect(info, r);
+    }
+  };
+
+  struct C_Linger_Ping : public Context {
+    Objecter *objecter;
+    LingerOp *info;
+    utime_t sent;
+    uint32_t register_gen;
+    C_Linger_Ping(Objecter *o, LingerOp *l)
+      : objecter(o), info(l), register_gen(info->register_gen) {
+      info->get();
+    }
+    ~C_Linger_Ping() {
+      info->put();
+    }
+    void finish(int r) {
+      objecter->_linger_ping(info, r, sent, register_gen);
     }
   };
 
@@ -1471,9 +1644,15 @@ public:
   };
   map<int,OSDSession*> osd_sessions;
 
+  bool osdmap_full_flag() const;
 
  private:
   map<uint64_t, LingerOp*>  linger_ops;
+  // we use this just to confirm a cookie is valid before dereferencing the ptr
+  set<LingerOp*>            linger_ops_set;
+  int num_linger_callbacks;
+  Mutex linger_callback_lock;
+  Cond linger_callback_cond;
 
   map<ceph_tid_t,PoolStatOp*>    poolstat_ops;
   map<ceph_tid_t,StatfsOp*>      statfs_ops;
@@ -1494,6 +1673,7 @@ public:
 
   MOSDOp *_prepare_osd_op(Op *op);
   void _send_op(Op *op, MOSDOp *m = NULL);
+  void _send_op_account(Op *op);
   void _cancel_linger_op(Op *op);
   void finish_op(OSDSession *session, ceph_tid_t tid);
   void _finish_op(Op *op);
@@ -1510,7 +1690,7 @@ public:
     RECALC_OP_TARGET_OSD_DNE,
     RECALC_OP_TARGET_OSD_DOWN,
   };
-  bool osdmap_full_flag() const;
+  bool _osdmap_full_flag() const;
 
   bool target_should_be_paused(op_target_t *op);
   int _calc_target(op_target_t *t, bool any_change=false);
@@ -1531,9 +1711,32 @@ public:
 
   void _linger_submit(LingerOp *info);
   void _send_linger(LingerOp *info);
-  void _linger_ack(LingerOp *info, int r);
+  void _linger_register(LingerOp *info, int r);
   void _linger_commit(LingerOp *info, int r);
+  void _linger_reconnect(LingerOp *info, int r);
+  void _send_linger_ping(LingerOp *info);
+  void _linger_ping(LingerOp *info, int r, utime_t sent, uint32_t register_gen);
+  int _normalize_watch_error(int r);
 
+  void _linger_callback_queue() {
+    Mutex::Locker l(linger_callback_lock);
+    ++num_linger_callbacks;
+  }
+  void _linger_callback_finish() {
+    Mutex::Locker l(linger_callback_lock);
+    if (--num_linger_callbacks == 0)
+      linger_callback_cond.SignalAll();
+    assert(num_linger_callbacks >= 0);
+  }
+  friend class C_DoWatchError;
+public:
+  void linger_callback_flush() {
+    Mutex::Locker l(linger_callback_lock);
+    while (num_linger_callbacks > 0)
+      linger_callback_cond.Wait(linger_callback_lock);
+  }
+
+private:
   void _check_op_pool_dne(Op *op, bool session_locked);
   void _send_op_map_check(Op *op);
   void _op_cancel_map_check(Op *op);
@@ -1554,6 +1757,8 @@ public:
   void _reopen_session(OSDSession *session);
   void close_session(OSDSession *session);
   
+  void _nlist_reply(NListContext *list_context, int r, Context *final_finish,
+		   epoch_t reply_epoch);
   void _list_reply(ListContext *list_context, int r, Context *final_finish,
 		   epoch_t reply_epoch);
 
@@ -1567,7 +1772,7 @@ public:
    */
   int calc_op_budget(Op *op);
   void _throttle_op(Op *op, int op_size=0);
-  void _take_op_budget(Op *op) {
+  int _take_op_budget(Op *op) {
     assert(rwlock.is_locked());
     int op_budget = calc_op_budget(op);
     if (keep_balanced_budget) {
@@ -1577,24 +1782,32 @@ public:
       op_throttle_ops.take(1);
     }
     op->budgeted = true;
+    return op_budget;
+  }
+  void put_op_budget_bytes(int op_budget) {
+    assert(op_budget >= 0);
+    op_throttle_bytes.put(op_budget);
+    op_throttle_ops.put(1);
   }
   void put_op_budget(Op *op) {
     assert(op->budgeted);
     int op_budget = calc_op_budget(op);
-    op_throttle_bytes.put(op_budget);
-    op_throttle_ops.put(1);
+    put_op_budget_bytes(op_budget);
   }
+  void put_list_context_budget(ListContext *list_context);
+  void put_nlist_context_budget(NListContext *list_context);
   Throttle op_throttle_bytes, op_throttle_ops;
 
  public:
   Objecter(CephContext *cct_, Messenger *m, MonClient *mc,
+	   Finisher *fin,
 	   double mon_timeout,
 	   double osd_timeout) :
     Dispatcher(cct),
-    messenger(m), monc(mc),
+    messenger(m), monc(mc), finisher(fin),
     osdmap(new OSDMap),
     cct(cct_),
-    initialized(false),
+    initialized(0),
     last_tid(0), client_inc(-1), max_linger_id(0),
     num_unacked(0), num_uncommitted(0),
     global_op_flags(0),
@@ -1602,15 +1815,19 @@ public:
     last_seen_osdmap_version(0),
     last_seen_pgmap_version(0),
     rwlock("Objecter::rwlock"),
-    timer(cct, rwlock),
+    timer_lock("Objecter::timer_lock"),
+    timer(cct, timer_lock, false),
     logger(NULL), tick_event(NULL),
     m_request_state_hook(NULL),
+    num_linger_callbacks(0),
+    linger_callback_lock("Objecter::linger_callback_lock"),
     num_homeless_ops(0),
     homeless_session(new OSDSession(cct, -1)),
     mon_timeout(mon_timeout),
     osd_timeout(osd_timeout),
     op_throttle_bytes(cct, "objecter_bytes", cct->_conf->objecter_inflight_op_bytes),
-    op_throttle_ops(cct, "objecter_ops", cct->_conf->objecter_inflight_ops)
+    op_throttle_ops(cct, "objecter_ops", cct->_conf->objecter_inflight_ops),
+    epoch_barrier(0)
   { }
   ~Objecter();
 
@@ -1658,6 +1875,7 @@ public:
   bool ms_can_fast_dispatch(Message *m) const {
     switch (m->get_type()) {
     case CEPH_MSG_OSD_OPREPLY:
+    case CEPH_MSG_WATCH_NOTIFY:
       return true;
     default:
       return false;
@@ -1668,6 +1886,7 @@ public:
   }
 
   void handle_osd_op_reply(class MOSDOpReply *m);
+  void handle_watch_notify(class MWatchNotify *m);
   void handle_osd_map(class MOSDMap *m);
   void wait_for_osd_map();
 
@@ -1679,12 +1898,12 @@ private:
 
   // low-level
   ceph_tid_t _op_submit(Op *op, RWLock::Context& lc);
-  ceph_tid_t _op_submit_with_budget(Op *op, RWLock::Context& lc);
+  ceph_tid_t _op_submit_with_budget(Op *op, RWLock::Context& lc, int *ctx_budget = NULL);
   inline void unregister_op(Op *op);
 
   // public interface
 public:
-  ceph_tid_t op_submit(Op *op);
+  ceph_tid_t op_submit(Op *op, int *ctx_budget = NULL);
   bool is_active() {
     return !((!inflight_ops.read()) && linger_ops.empty() && poolstat_ops.empty() && statfs_ops.empty());
   }
@@ -1709,6 +1928,7 @@ public:
   int get_client_incarnation() const { return client_inc.read(); }
   void set_client_incarnation(int inc) { client_inc.set(inc); }
 
+  bool have_map(epoch_t epoch);
   /// wait for epoch; true if we already have it
   bool wait_for_map(epoch_t epoch, Context *c, int err=0);
   void _wait_for_new_map(Context *c, epoch_t epoch, int err=0);
@@ -1726,9 +1946,11 @@ public:
   /// cancel an in-progress request with the given return code
 private:
   int op_cancel(OSDSession *s, ceph_tid_t tid, int r);
+  int _op_cancel(ceph_tid_t tid, int r);
   friend class C_CancelOp;
 public:
   int op_cancel(ceph_tid_t tid, int r);
+  epoch_t op_cancel_writes(int r);
 
   // commands
   int osd_command(int osd, vector<string>& cmd,
@@ -1800,7 +2022,8 @@ public:
 		ObjectOperation& op,
 		bufferlist *pbl, int flags,
 		Context *onack,
-		epoch_t *reply_epoch) {
+		epoch_t *reply_epoch,
+                int *ctx_budget) {
     Op *o = new Op(object_t(), oloc,
 		   op.ops, flags | global_op_flags.read() | CEPH_OSD_FLAG_READ,
 		   onack, NULL, NULL);
@@ -1813,21 +2036,33 @@ public:
     o->out_handler.swap(op.out_handler);
     o->out_rval.swap(op.out_rval);
     o->reply_epoch = reply_epoch;
-    return op_submit(o);
+    if (ctx_budget) {
+      // budget is tracked by listing context
+      o->ctx_budgeted = true;
+    }
+    return op_submit(o, ctx_budget);
   }
-  ceph_tid_t linger_mutate(const object_t& oid, const object_locator_t& oloc,
-		      ObjectOperation& op,
-		      const SnapContext& snapc, utime_t mtime,
-		      bufferlist& inbl, int flags,
-		      Context *onack, Context *onfinish,
-		      version_t *objver);
-  ceph_tid_t linger_read(const object_t& oid, const object_locator_t& oloc,
-		    ObjectOperation& op,
-		    snapid_t snap, bufferlist& inbl, bufferlist *poutbl, int flags,
-		    Context *onack,
-		    version_t *objver);
-  void unregister_linger(uint64_t linger_id);
-  void _unregister_linger(uint64_t linger_id);
+
+  // caller owns a ref
+  LingerOp *linger_register(const object_t& oid, const object_locator_t& oloc,
+			    int flags);
+  ceph_tid_t linger_watch(LingerOp *info,
+			  ObjectOperation& op,
+			  const SnapContext& snapc, utime_t mtime,
+			  bufferlist& inbl,
+			  Context *onfinish,
+			  version_t *objver);
+  ceph_tid_t linger_notify(LingerOp *info,
+			   ObjectOperation& op,
+			   snapid_t snap, bufferlist& inbl,
+			   bufferlist *poutbl,
+			   Context *onack,
+			   version_t *objver);
+  int linger_check(LingerOp *info);
+  void linger_cancel(LingerOp *info);  // releases a reference
+  void _linger_cancel(LingerOp *info);
+
+  void _do_watch_notify(LingerOp *info, MWatchNotify *m);
 
   /**
    * set up initial ops in the op vector, and allocate a final op slot.
@@ -2158,6 +2393,8 @@ public:
     return op_submit(o);
   }
 
+  void list_nobjects(NListContext *p, Context *onfinish);
+  uint32_t list_nobjects_seek(NListContext *p, uint32_t pos);
   void list_objects(ListContext *p, Context *onfinish);
   uint32_t list_objects_seek(ListContext *p, uint32_t pos);
 
@@ -2288,6 +2525,11 @@ public:
 			 bool force_new);
 
   void blacklist_self(bool set);
+
+private:
+  epoch_t epoch_barrier;
+public:
+  void set_epoch_barrier(epoch_t epoch);
 };
 
 #endif

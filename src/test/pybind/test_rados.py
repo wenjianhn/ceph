@@ -1,6 +1,8 @@
 from nose.tools import eq_ as eq, assert_raises
-from rados import (Rados, Error, Object, ObjectExists, ObjectNotFound,
-                   ANONYMOUS_AUID, ADMIN_AUID)
+from rados import (Rados, Error, RadosStateError, Object, ObjectExists,
+                   ObjectNotFound, ObjectBusy,
+                   ANONYMOUS_AUID, ADMIN_AUID, LIBRADOS_ALL_NSPACES)
+import time
 import threading
 import json
 import errno
@@ -35,6 +37,55 @@ def test_ioctx_context_manager():
     with Rados(conffile='', rados_id='admin') as conn:
         with conn.open_ioctx('rbd') as ioctx:
             pass
+
+
+class TestRadosStateError(object):
+    def _requires_configuring(self, rados):
+        assert_raises(RadosStateError, rados.connect)
+
+    def _requires_configuring_or_connected(self, rados):
+        assert_raises(RadosStateError, rados.conf_read_file)
+        assert_raises(RadosStateError, rados.conf_parse_argv, None)
+        assert_raises(RadosStateError, rados.conf_parse_env)
+        assert_raises(RadosStateError, rados.conf_get, 'opt')
+        assert_raises(RadosStateError, rados.conf_set, 'opt', 'val')
+        assert_raises(RadosStateError, rados.ping_monitor, 0)
+
+    def _requires_connected(self, rados):
+        assert_raises(RadosStateError, rados.pool_exists, 'foo')
+        assert_raises(RadosStateError, rados.pool_lookup, 'foo')
+        assert_raises(RadosStateError, rados.pool_reverse_lookup, 0)
+        assert_raises(RadosStateError, rados.create_pool, 'foo')
+        assert_raises(RadosStateError, rados.get_pool_base_tier, 0)
+        assert_raises(RadosStateError, rados.delete_pool, 'foo')
+        assert_raises(RadosStateError, rados.list_pools)
+        assert_raises(RadosStateError, rados.get_fsid)
+        assert_raises(RadosStateError, rados.open_ioctx, 'foo')
+        assert_raises(RadosStateError, rados.mon_command, '', '')
+        assert_raises(RadosStateError, rados.osd_command, 0, '', '')
+        assert_raises(RadosStateError, rados.pg_command, '', '', '')
+        assert_raises(RadosStateError, rados.wait_for_latest_osdmap)
+
+    def test_configuring(self):
+        rados = Rados(conffile='')
+        eq('configuring', rados.state)
+        self._requires_connected(rados)
+
+    def test_connected(self):
+        rados = Rados(conffile='')
+        with rados:
+            eq('connected', rados.state)
+            self._requires_configuring(rados)
+
+    def test_shutdown(self):
+        rados = Rados(conffile='')
+        with rados:
+            pass
+        eq('shutdown', rados.state)
+        self._requires_configuring(rados)
+        self._requires_configuring_or_connected(rados)
+        self._requires_connected(rados)
+
 
 class TestRados(object):
 
@@ -88,6 +139,36 @@ class TestRados(object):
         eq(set(['a' * 500]), self.list_non_default_pools())
         self.rados.delete_pool('a' * 500)
 
+    def test_get_pool_base_tier(self):
+        self.rados.create_pool('foo')
+        try:
+            self.rados.create_pool('foo-cache')
+            try:
+                pool_id = self.rados.pool_lookup('foo')
+                tier_pool_id = self.rados.pool_lookup('foo-cache')
+
+                cmd = {"prefix":"osd tier add", "pool":"foo", "tierpool":"foo-cache", "force_nonempty":""}
+                ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30)
+                eq(ret, 0)
+
+                try:
+                    cmd = {"prefix":"osd tier cache-mode", "pool":"foo-cache", "tierpool":"foo-cache", "mode":"readonly"}
+                    ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30)
+                    eq(ret, 0)
+
+                    eq(self.rados.wait_for_latest_osdmap(), 0)
+
+                    eq(pool_id, self.rados.get_pool_base_tier(pool_id))
+                    eq(pool_id, self.rados.get_pool_base_tier(tier_pool_id))
+                finally:
+                    cmd = {"prefix":"osd tier remove", "pool":"foo", "tierpool":"foo-cache"}
+                    ret, buf, errs = self.rados.mon_command(json.dumps(cmd), '', timeout=30)
+                    eq(ret, 0)
+            finally:
+                self.rados.delete_pool('foo-cache')
+        finally:
+            self.rados.delete_pool('foo')
+
     def test_get_fsid(self):
         fsid = self.rados.get_fsid()
         eq(len(fsid), 36)
@@ -102,6 +183,8 @@ class TestIoctx(object):
         self.ioctx = self.rados.open_ioctx('test_pool')
 
     def tearDown(self):
+        cmd = {"prefix":"osd unset", "key":"noup"}
+        self.rados.mon_command(json.dumps(cmd), '')
         self.ioctx.close()
         self.rados.delete_pool('test_pool')
         self.rados.shutdown()
@@ -147,6 +230,23 @@ class TestIoctx(object):
         self.ioctx.append('d', 'jazz')
         object_names = [obj.key for obj in self.ioctx.list_objects()]
         eq(sorted(object_names), ['a', 'b', 'c', 'd'])
+
+    def test_list_ns_objects(self):
+        self.ioctx.write('a', '')
+        self.ioctx.write('b', 'foo')
+        self.ioctx.write_full('c', 'bar')
+        self.ioctx.append('d', 'jazz')
+        self.ioctx.set_namespace("ns1")
+        self.ioctx.write('ns1-a', '')
+        self.ioctx.write('ns1-b', 'foo')
+        self.ioctx.write_full('ns1-c', 'bar')
+        self.ioctx.append('ns1-d', 'jazz')
+        self.ioctx.append('d', 'jazz')
+        self.ioctx.set_namespace(LIBRADOS_ALL_NSPACES)
+        object_names = [(obj.nspace, obj.key) for obj in self.ioctx.list_objects()]
+        eq(sorted(object_names), [('', 'a'), ('','b'), ('','c'), ('','d'),\
+                ('ns1', 'd'), ('ns1', 'ns1-a'), ('ns1', 'ns1-b'),\
+                ('ns1', 'ns1-c'), ('ns1', 'ns1-d')])
 
     def test_xattrs(self):
         xattrs = dict(a='1', b='2', c='3', d='a\0b', e='\0')
@@ -281,20 +381,104 @@ class TestIoctx(object):
         eq(contents, "bar")
         [i.remove() for i in self.ioctx.list_objects()]
 
+    def _take_down_acting_set(self, pool, objectname):
+        # find acting_set for pool:objectname and take it down; used to
+        # verify that async reads don't complete while acting set is missing
+        cmd = {
+            "prefix":"osd map",
+            "pool":pool,
+            "object":objectname,
+            "format":"json",
+        }
+        r, jsonout, _ = self.rados.mon_command(json.dumps(cmd), '')
+        objmap = json.loads(jsonout)
+        acting_set = objmap['acting']
+        cmd = {"prefix":"osd set", "key":"noup"}
+        r, _, _ = self.rados.mon_command(json.dumps(cmd), '')
+        eq(r, 0)
+        cmd = {"prefix":"osd down", "ids":[str(i) for i in acting_set]}
+        r, _, _ = self.rados.mon_command(json.dumps(cmd), '')
+        eq(r, 0)
+
+        # wait for OSDs to acknowledge the down
+        eq(self.rados.wait_for_latest_osdmap(), 0)
+
+    def _let_osds_back_up(self):
+        cmd = {"prefix":"osd unset", "key":"noup"}
+        r, _, _ = self.rados.mon_command(json.dumps(cmd), '')
+        eq(r, 0)
+
     def test_aio_read(self):
+        # this is a list so that the local cb() can modify it
         retval = [None]
         lock = threading.Condition()
         def cb(_, buf):
             with lock:
                 retval[0] = buf
                 lock.notify()
-        self.ioctx.write("foo", "bar")
-        self.ioctx.aio_read("foo", 3, 0, cb)
+        payload = "bar\000frob"
+        self.ioctx.write("foo", payload)
+
+        # test1: use wait_for_complete() and wait for cb by
+        # watching retval[0]
+        self._take_down_acting_set('test_pool', 'foo')
+        comp = self.ioctx.aio_read("foo", len(payload), 0, cb)
+        eq(False, comp.is_complete())
+        time.sleep(3)
+        eq(False, comp.is_complete())
         with lock:
-            while retval[0] is None:
-                lock.wait()
-        eq(retval[0], "bar")
+            eq(None, retval[0])
+        self._let_osds_back_up()
+        comp.wait_for_complete()
+        loops = 0
+        with lock:
+            while retval[0] is None and loops <= 10:
+                lock.wait(timeout=5)
+                loops += 1
+        assert(loops <= 10)
+
+        eq(retval[0], payload)
+
+        # test2: use wait_for_complete_and_cb(), verify retval[0] is
+        # set by the time we regain control
+
+        retval[0] = None
+        self._take_down_acting_set('test_pool', 'foo')
+        comp = self.ioctx.aio_read("foo", len(payload), 0, cb)
+        eq(False, comp.is_complete())
+        time.sleep(3)
+        eq(False, comp.is_complete())
+        with lock:
+            eq(None, retval[0])
+        self._let_osds_back_up()
+
+        comp.wait_for_complete_and_cb()
+        assert(retval[0] is not None)
+        eq(retval[0], payload)
+
         [i.remove() for i in self.ioctx.list_objects()]
+
+    def test_lock(self):
+        self.ioctx.lock_exclusive("foo", "lock", "locker", "desc_lock",
+                                  10000, 0)
+        assert_raises(ObjectExists,
+                      self.ioctx.lock_exclusive,
+                      "foo", "lock", "locker", "desc_lock", 10000, 0)
+        self.ioctx.unlock("foo", "lock", "locker")
+        assert_raises(ObjectNotFound, self.ioctx.unlock, "foo", "lock", "locker")
+
+        self.ioctx.lock_shared("foo", "lock", "locker1", "tag", "desc_lock",
+                               10000, 0)
+        self.ioctx.lock_shared("foo", "lock", "locker2", "tag", "desc_lock",
+                               10000, 0)
+        assert_raises(ObjectBusy,
+                      self.ioctx.lock_exclusive,
+                      "foo", "lock", "locker3", "desc_lock", 10000, 0)
+        self.ioctx.unlock("foo", "lock", "locker1")
+        self.ioctx.unlock("foo", "lock", "locker2")
+        assert_raises(ObjectNotFound, self.ioctx.unlock, "foo", "lock", "locker1")
+        assert_raises(ObjectNotFound, self.ioctx.unlock, "foo", "lock", "locker2")
+
 
 class TestObject(object):
 

@@ -251,8 +251,8 @@ public:
   void redo_full_sets();
   void register_nearfull_status(int osd, const osd_stat_t& s);
   void calc_stats();
-  void stat_pg_add(const pg_t &pgid, const pg_stat_t &s);
-  void stat_pg_sub(const pg_t &pgid, const pg_stat_t &s);
+  void stat_pg_add(const pg_t &pgid, const pg_stat_t &s, bool sumonly=false);
+  void stat_pg_sub(const pg_t &pgid, const pg_stat_t &s, bool sumonly=false);
   void stat_osd_add(const osd_stat_t &s);
   void stat_osd_sub(const osd_stat_t &s);
   
@@ -283,10 +283,10 @@ public:
   void dump_osd_blocked_by_stats(Formatter *f) const;
   void print_osd_blocked_by_stats(std::ostream *ss) const;
 
-  void recovery_summary(Formatter *f, ostream *out,
+  void recovery_summary(Formatter *f, list<string> *psl,
                         const pool_stat_t& delta_sum) const;
-  void overall_recovery_summary(Formatter *f, ostream *out) const;
-  void pool_recovery_summary(Formatter *f, ostream *out,
+  void overall_recovery_summary(Formatter *f, list<string> *psl) const;
+  void pool_recovery_summary(Formatter *f, list<string> *psl,
                              uint64_t poolid) const;
   void recovery_rate_summary(Formatter *f, ostream *out,
                              const pool_stat_t& delta_sum,
@@ -315,7 +315,7 @@ public:
                                    uint64_t poolid) const;
 
   void print_summary(Formatter *f, ostream *out) const;
-  void print_oneline_summary(ostream *out) const;
+  void print_oneline_summary(Formatter *f, ostream *out) const;
 
   epoch_t get_min_last_epoch_clean() const {
     if (!min_last_epoch_clean)
@@ -329,7 +329,7 @@ WRITE_CLASS_ENCODER_FEATURES(PGMap::Incremental)
 WRITE_CLASS_ENCODER_FEATURES(PGMap)
 
 inline ostream& operator<<(ostream& out, const PGMap& m) {
-  m.print_oneline_summary(&out);
+  m.print_oneline_summary(NULL, &out);
   return out;
 }
 

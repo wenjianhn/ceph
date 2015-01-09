@@ -1,6 +1,7 @@
 #!/bin/bash
 #
 # Copyright (C) 2014 Cloudwatt <libre.licensing@cloudwatt.com>
+# Copyright (C) 2014 Red Hat <contact@redhat.com>
 #
 # Author: Loic Dachary <loic@dachary.org>
 #
@@ -19,14 +20,15 @@ source test/mon/mon-test-helpers.sh
 function run() {
     local dir=$1
 
+    export CEPH_MON="127.0.0.1:7104"
     export CEPH_ARGS
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
-    CEPH_ARGS+="--mon-host=127.0.0.1 "
+    CEPH_ARGS+="--mon-host=$CEPH_MON "
 
     FUNCTIONS=${FUNCTIONS:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
     for TEST_function in $FUNCTIONS ; do
 	setup $dir || return 1
-	run_mon $dir a --public-addr 127.0.0.1
+	run_mon $dir a --public-addr $CEPH_MON
 	if ! $TEST_function $dir ; then
 	  cat $dir/a/log
 	  return 1
@@ -39,7 +41,7 @@ function TEST_crush_rule_create_simple() {
     local dir=$1
     ./ceph --format xml osd crush rule dump replicated_ruleset | \
         egrep '<op>take</op><item>[^<]+</item><item_name>default</item_name>' | \
-        grep '<op>chooseleaf_firstn</op><num>0</num><type>host</type>' || return 1
+        grep '<op>choose_firstn</op><num>0</num><type>osd</type>' || return 1
     local ruleset=ruleset0
     local root=host1
     ./ceph osd crush add-bucket $root host
@@ -72,20 +74,6 @@ function TEST_crush_rule_rm() {
     ./ceph osd crush rule ls | grep $ruleset || return 1
     ./ceph osd crush rule rm $ruleset || return 1
     ! ./ceph osd crush rule ls | grep $ruleset || return 1
-}
-
-function TEST_crush_rule_create_simple_exists() {
-    local dir=$1
-    local ruleset=ruleset2
-    local root=default
-    local failure_domain=host
-    ./ceph osd erasure-code-profile ls
-    # add to the pending OSD map without triggering a paxos proposal
-    result=$(echo '{"prefix":"osdmonitor_prepare_command","prepare":"osd crush rule create-simple","name":"'$ruleset'","root":"'$root'","type":"'$failure_domain'"}' | nc -U $dir/a/ceph-mon.a.asok | cut --bytes=5-)
-    test $result = true || return 1
-    ./ceph osd crush rule create-simple $ruleset $root $failure_domain 2>&1 | \
-        grep "$ruleset already exists" || return 1
-    ./ceph osd crush rule rm $ruleset || return 1
 }
 
 function TEST_crush_rule_create_erasure() {
@@ -122,35 +110,7 @@ function TEST_crush_rule_create_erasure() {
     ! ./ceph osd crush rule ls | grep $ruleset || return 1
 }
 
-function TEST_crush_rule_create_erasure_exists() {
-    local dir=$1
-    local ruleset=ruleset5
-    ./ceph osd erasure-code-profile ls
-    # add to the pending OSD map without triggering a paxos proposal
-    result=$(echo '{"prefix":"osdmonitor_prepare_command","prepare":"osd crush rule create-erasure","name":"'$ruleset'"}' | nc -U $dir/a/ceph-mon.a.asok | cut --bytes=5-)
-    test $result = true || return 1
-    ./ceph osd crush rule create-erasure $ruleset 2>&1 | \
-        grep "$ruleset already exists" || return 1
-    ./ceph osd crush rule rm $ruleset || return 1
-}
-
-function TEST_crush_rule_create_erasure_profile_default_exists() {
-    local dir=$1
-    local ruleset=ruleset6
-    ./ceph osd erasure-code-profile ls
-    ./ceph osd erasure-code-profile rm default || return 1
-    ! ./ceph osd erasure-code-profile ls | grep default || return 1
-    # add to the pending OSD map without triggering a paxos proposal
-    result=$(echo '{"prefix":"osdmonitor_prepare_command","prepare":"osd erasure-code-profile set","name":"default"}' | nc -U $dir/a/ceph-mon.a.asok | cut --bytes=5-)
-    test $result = true || return 1
-    ./ceph osd crush rule create-erasure $ruleset || return 1
-    CEPH_ARGS='' ./ceph --admin-daemon $dir/a/ceph-mon.a.asok log flush || return 1
-    grep 'profile default already pending' $dir/a/log || return 1
-    ./ceph osd crush rule rm $ruleset || return 1
-    ./ceph osd erasure-code-profile ls | grep default || return 1
-}
-
-function Check_ruleset_id_match_rule_id() {
+function check_ruleset_id_match_rule_id() {
     local rule_name=$1
     rule_id=`./ceph osd crush rule dump $rule_name | grep "\"rule_id\":" | awk -F ":|," '{print int($2)}'`
     ruleset_id=`./ceph osd crush rule dump $rule_name | grep "\"ruleset\":"| awk -F ":|," '{print int($2)}'`
@@ -185,7 +145,7 @@ function TEST_crush_ruleset_match_rule_when_creating() {
 
     ./ceph osd crush rule dump
     #show special_rule_simple has same rule_id and ruleset_id
-    Check_ruleset_id_match_rule_id special_rule_simple || return 1
+    check_ruleset_id_match_rule_id special_rule_simple || return 1
 }
 
 function TEST_add_ruleset_failed() {
@@ -215,6 +175,17 @@ EOF
     ./ceph osd setcrushmap -i $dir/crushmap  || return 1
     ./ceph osd crush rule create-simple test_rule_nospace $root osd firstn 2>&1 | grep "Error ENOSPC" || return 1
 
+}
+
+function TEST_crush_rename_bucket() {
+    local dir=$1
+
+    ./ceph osd crush add-bucket host1 host
+    ! ./ceph osd tree | grep host2 || return 1
+    ./ceph osd crush rename-bucket host1 host2 || return 1
+    ./ceph osd tree | grep host2 || return 1
+    ./ceph osd crush rename-bucket host1 host2 || return 1 # idempotency
+    ./ceph osd crush rename-bucket nonexistent something 2>&1 | grep "Error ENOENT" || return 1
 }
 
 main osd-crush

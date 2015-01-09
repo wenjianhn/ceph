@@ -167,7 +167,8 @@ COMMAND("auth import", "auth import: read keyring file from -i <file>", \
 COMMAND("auth add " \
 	"name=entity,type=CephString " \
 	"name=caps,type=CephString,n=N,req=false", \
-	"add auth info for <entity> from input file, or random key if no input given, and/or any caps specified in the command",
+	"add auth info for <entity> from input file, or random key if no " \
+        "input is given, and/or any caps specified in the command",
 	"auth", "rwx", "cli,rest")
 COMMAND("auth get-or-create-key " \
 	"name=entity,type=CephString " \
@@ -399,6 +400,11 @@ COMMAND("osd crush add-bucket " \
 	"name=type,type=CephString", \
 	"add no-parent (probably root) crush bucket <name> of type <type>", \
 	"osd", "rw", "cli,rest")
+COMMAND("osd crush rename-bucket " \
+	"name=srcname,type=CephString,goodchars=[A-Za-z0-9-_.] " \
+	"name=dstname,type=CephString,goodchars=[A-Za-z0-9-_.]", \
+	"rename bucket <srcname> to <dstname>", \
+	"osd", "rw", "cli,rest")
 COMMAND("osd crush set " \
 	"name=id,type=CephOsdName " \
 	"name=weight,type=CephFloat,range=0.0 " \
@@ -442,6 +448,9 @@ COMMAND("osd crush unlink " \
 	"name=ancestor,type=CephString,req=false,goodchars=[A-Za-z0-9-_.]", \
 	"unlink <name> from crush map (everywhere, or just at <ancestor>)", \
 	"osd", "rw", "cli,rest")
+COMMAND("osd crush reweight-all",
+	"recalculate the weights for the tree to ensure they sum correctly",
+	"osd", "rw", "cli,rest")
 COMMAND("osd crush reweight " \
 	"name=name,type=CephString,goodchars=[A-Za-z0-9-_.] " \
 	"name=weight,type=CephFloat,range=0.0", \
@@ -453,8 +462,17 @@ COMMAND("osd crush reweight-subtree " \
 	"change all leaf items beneath <name> to <weight> in crush map", \
 	"osd", "rw", "cli,rest")
 COMMAND("osd crush tunables " \
-	"name=profile,type=CephChoices,strings=legacy|argonaut|bobtail|firefly|optimal|default", \
+	"name=profile,type=CephChoices,strings=legacy|argonaut|bobtail|firefly|hammer|optimal|default", \
 	"set crush tunables values to <profile>", "osd", "rw", "cli,rest")
+COMMAND("osd crush set-tunable "				    \
+	"name=tunable,type=CephChoices,strings=straw_calc_version " \
+	"name=value,type=CephInt",
+	"set crush tunable <tunable> to <value>",
+	"osd", "rw", "cli,rest")
+COMMAND("osd crush get-tunable "			      \
+	"name=tunable,type=CephChoices,strings=straw_calc_version",
+	"get crush tunable <tunable>",
+	"osd", "rw", "cli,rest")
 COMMAND("osd crush show-tunables", \
 	"show current crush tunables", "osd", "r", "cli,rest")
 COMMAND("osd crush rule create-simple " \
@@ -494,10 +512,10 @@ COMMAND("osd erasure-code-profile ls", \
 	"list all erasure code profiles", \
 	"osd", "r", "cli,rest")
 COMMAND("osd set " \
-	"name=key,type=CephChoices,strings=pause|noup|nodown|noout|noin|nobackfill|norecover|noscrub|nodeep-scrub|notieragent", \
+	"name=key,type=CephChoices,strings=full|pause|noup|nodown|noout|noin|nobackfill|norecover|noscrub|nodeep-scrub|notieragent", \
 	"set <key>", "osd", "rw", "cli,rest")
 COMMAND("osd unset " \
-	"name=key,type=CephChoices,strings=pause|noup|nodown|noout|noin|nobackfill|norecover|noscrub|nodeep-scrub|notieragent", \
+	"name=key,type=CephChoices,strings=full|pause|noup|nodown|noout|noin|nobackfill|norecover|noscrub|nodeep-scrub|notieragent", \
 	"unset <key>", "osd", "rw", "cli,rest")
 COMMAND("osd cluster_snap", "take cluster snapshot (disabled)", \
 	"osd", "r", "")
@@ -554,6 +572,9 @@ COMMAND("osd pool rmsnap " \
 	"name=pool,type=CephPoolname " \
 	"name=snap,type=CephString", \
 	"remove snapshot <snap> from <pool>", "osd", "rw", "cli,rest")
+COMMAND("osd pool ls " \
+	"name=detail,type=CephChoices,strings=detail,req=false", \
+	"list pools", "osd", "r", "cli,rest")
 COMMAND("osd pool create " \
 	"name=pool,type=CephPoolname " \
 	"name=pg_num,type=CephInt,range=0 " \

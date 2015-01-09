@@ -16,7 +16,7 @@ ceph_objectstore_tool_LDADD = $(LIBOSD) $(LIBOS) $(CEPH_GLOBAL) $(BOOST_PROGRAM_
 if LINUX
 ceph_objectstore_tool_LDADD += -ldl
 endif # LINUX
-bin_PROGRAMS += ceph_objectstore_tool
+bin_PROGRAMS += ceph-objectstore-tool
 
 monmaptool_SOURCES = tools/monmaptool.cc
 monmaptool_LDADD = $(CEPH_GLOBAL) $(LIBCOMMON)
@@ -41,10 +41,6 @@ bin_DEBUGPROGRAMS += ceph_scratchtoolpp
 ceph_psim_SOURCES = tools/psim.cc
 ceph_psim_LDADD = $(CEPH_GLOBAL)
 bin_DEBUGPROGRAMS += ceph_psim
-
-ceph_dupstore_SOURCES = tools/dupstore.cc
-ceph_dupstore_LDADD = $(LIBOS) $(CEPH_GLOBAL)
-bin_DEBUGPROGRAMS += ceph_dupstore
 
 ceph_radosacl_SOURCES = tools/radosacl.cc
 ceph_radosacl_LDADD = $(LIBRADOS) $(CEPH_GLOBAL)
@@ -110,6 +106,5 @@ noinst_HEADERS += \
 	tools/cephfs/Resetter.h \
 	tools/cephfs/Dumper.h \
 	tools/cephfs/MDSUtility.h \
-	tools/rados/rados_sync.h \
-	tools/common.h
+	tools/rados/rados_sync.h
 

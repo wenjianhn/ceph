@@ -557,6 +557,7 @@ public:
 
 private:
   void _reset();   ///< called from bootstrap, start_, or join_election
+  void wait_for_paxos_write();
 public:
   void bootstrap();
   void join_election();
@@ -647,7 +648,6 @@ public:
                         const MonCommand *this_cmd);
   void get_mon_status(Formatter *f, ostream& ss);
   void _quorum_status(Formatter *f, ostream& ss);
-  bool _osdmonitor_prepare_command(cmdmap_t& cmdmap, ostream& ss);
   bool _add_bootstrap_peer_hint(string cmd, cmdmap_t& cmdmap, ostream& ss);
   void handle_command(class MMonCommand *m);
   void handle_route(MRoute *m);
@@ -658,7 +658,7 @@ public:
    * @param status one-line status summary
    * @param detailbl optional bufferlist* to fill with a detailed report
    */
-  void get_health(string& status, bufferlist *detailbl, Formatter *f);
+  void get_health(list<string>& status, bufferlist *detailbl, Formatter *f);
   void get_cluster_status(stringstream &ss, Formatter *f);
 
   void reply_command(MMonCommand *m, int rc, const string &rs, version_t version);
@@ -737,12 +737,7 @@ public:
           // if client drops we may not have a session to draw information from.
           if (s) {
             ss << "from='" << s->inst << "' "
-              << "entity='";
-            if (s->auth_handler)
-              ss << s->auth_handler->get_entity_name();
-            else
-              ss << "forwarded-request";
-            ss << "' ";
+              << "entity='" << s->entity_name << "' ";
           } else {
             ss << "session dropped for command ";
           }
@@ -820,11 +815,6 @@ public:
   virtual void handle_conf_change(const struct md_config_t *conf,
                                   const std::set<std::string> &changed);
 
-  void update_log_client(LogChannelRef lc, const string &name,
-                         map<string,string> &log_to_monitors,
-                         map<string,string> &log_to_syslog,
-                         map<string,string> &log_channels,
-                         map<string,string> &log_prios);
   void update_log_clients();
   int sanitize_options();
   int preinit();
@@ -956,6 +946,7 @@ public:
 #define CEPH_MON_FEATURE_INCOMPAT_SINGLE_PAXOS CompatSet::Feature (3, "single paxos with k/v store (v0.\?)")
 #define CEPH_MON_FEATURE_INCOMPAT_OSD_ERASURE_CODES CompatSet::Feature(4, "support erasure code pools")
 #define CEPH_MON_FEATURE_INCOMPAT_OSDMAP_ENC CompatSet::Feature(5, "new-style osdmap encoding")
+#define CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V2 CompatSet::Feature(6, "support isa/lrc erasure code")
 // make sure you add your feature to Monitor::get_supported_features
 
 long parse_pos_long(const char *s, ostream *pss = NULL);
@@ -1012,50 +1003,11 @@ struct MonCommand {
     ::decode_array_nohead(*cmds, *size, bl);
     DECODE_FINISH(bl);
   }
+
+  bool requires_perm(char p) const {
+    return (req_perms.find(p) != string::npos); 
+  }
 };
 WRITE_CLASS_ENCODER(MonCommand)
-
-// Having this here is less than optimal, but we needed to keep it
-// somewhere as to avoid code duplication, as it will be needed both
-// on the Monitor class and the LogMonitor class.
-//
-// We are attempting to avoid code duplication in the event that
-// changing how the mechanisms currently work will lead to unnecessary
-// issues, resulting from the need of changing this function in multiple
-// places.
-//
-// This function is just a helper to perform a task that should not be
-// needed anywhere else besides the two functions that shall call it.
-//
-// This function's only purpose is to check whether a given map has only
-// ONE key with an empty value (which would mean that 'get_str_map()' read
-// a map in the form of 'VALUE', without any KEY/VALUE pairs) and, in such
-// event, to assign said 'VALUE' to a given 'def_key', such that we end up
-// with a map of the form "m = { 'def_key' : 'VALUE' }" instead of the
-// original "m = { 'VALUE' : '' }".
-static inline int get_conf_str_map_helper(
-    const string &str,
-    ostringstream &oss,
-    map<string,string> *m,
-    const string &def_key)
-{
-  int r = get_str_map(str, m);
-
-  if (r < 0) {
-    generic_derr << __func__ << " error: " << oss.str() << dendl;
-    return r;
-  }
-
-  if (r >= 0 && m->size() == 1) {
-    map<string,string>::iterator p = m->begin();
-    if (p->second.empty()) {
-      string s = p->first;
-      m->erase(s);
-      (*m)[def_key] = s;
-    }
-  }
-  return r;
-}
-
 
 #endif

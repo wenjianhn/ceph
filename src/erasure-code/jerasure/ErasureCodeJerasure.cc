@@ -199,7 +199,7 @@ int ErasureCodeJerasureReedSolomonVandermonde::parse(const map<std::string,std::
     w = DEFAULT_W;
     err = -EINVAL;
   }
-  err |= to_bool("jerasure-per-chunk-alignement", parameters,
+  err |= to_bool("jerasure-per-chunk-alignment", parameters,
 		 &per_chunk_alignment, false, ss);
   return err;
 }
@@ -298,15 +298,8 @@ int ErasureCodeJerasureCauchy::parse(const map<std::string,std::string> &paramet
 				     ostream *ss)
 {
   int err = ErasureCodeJerasure::parse(parameters, ss);
-  if (w != 8 && w != 16 && w != 32) {
-    *ss << "Cauchy: w=" << w
-	<< " must be one of {8, 16, 32} : revert to " 
-        << DEFAULT_W << std::endl;
-    w = DEFAULT_W;
-    err = -EINVAL;
-  }
   err |= to_int("packetsize", parameters, &packetsize, DEFAULT_PACKETSIZE, ss);
-  err |= to_bool("jerasure-per-chunk-alignement", parameters,
+  err |= to_bool("jerasure-per-chunk-alignment", parameters,
 		 &per_chunk_alignment, false, ss);
   return err;
 }
@@ -454,6 +447,10 @@ void ErasureCodeJerasureLiberation::prepare()
 //
 bool ErasureCodeJerasureBlaumRoth::check_w(ostream *ss) const
 {
+  // back in Firefly, w = 7 was the default and produced useable 
+  // chunks. Tolerate this value for backward compatibility.
+  if (w == 7)
+    return true;
   if (w <= 2 || !is_prime(w+1)) {
     *ss <<  "w=" << w << " must be greater than two and "
 	<< "w+1 must be prime" << std::endl;

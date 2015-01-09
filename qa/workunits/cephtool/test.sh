@@ -5,6 +5,24 @@ set -o functrace
 PS4=' ${FUNCNAME[0]}: $LINENO: '
 SUDO=${SUDO:-sudo}
 
+function check_no_osd_down()
+{
+    ! ceph osd dump | grep ' down '
+}
+
+function wait_no_osd_down()
+{
+  for i in $(seq 1 300) ; do
+    if ! check_no_osd_down ; then
+      echo "waiting for osd(s) to come back up"
+      sleep 1
+    else
+      break
+    fi
+  done
+  check_no_osd_down
+}
+
 function get_pg()
 {
 	local pool obj map_output pg
@@ -34,9 +52,60 @@ trap "rm -fr $TMPDIR" 0
 
 TMPFILE=$TMPDIR/test_invalid.$$
 
+#
+# retry_eagain max cmd args ...
+#
+# retry cmd args ... if it exits on error and its output contains the
+# string EAGAIN, at most $max times
+#
+function retry_eagain()
+{
+    local max=$1
+    shift
+    local status
+    local tmpfile=$TMPDIR/retry_eagain.$$
+    local count
+    for count in $(seq 1 $max) ; do
+        status=0
+        "$@" > $tmpfile 2>&1 || status=$?
+        if test $status = 0 || 
+            ! grep --quiet EAGAIN $tmpfile ; then
+            break
+        fi
+        sleep 1
+    done
+    if test $count = $max ; then
+        echo retried with non zero exit status, $max times: "$@" >&2
+    fi
+    cat $tmpfile
+    rm $tmpfile
+    return $status
+}
+
+#
+# map_enxio_to_eagain cmd arg ...
+#
+# add EAGAIN to the output of cmd arg ... if the output contains
+# ENXIO.
+#
+function map_enxio_to_eagain()
+{
+    local status=0
+    local tmpfile=$TMPDIR/map_enxio_to_eagain.$$
+
+    "$@" > $tmpfile 2>&1 || status=$?
+    if test $status != 0 &&
+        grep --quiet ENXIO $tmpfile ; then
+        echo "EAGAIN added by $0::map_enxio_to_eagain" >> $tmpfile
+    fi
+    cat $tmpfile
+    rm $tmpfile
+    return $status
+}
+
 function check_response()
 {
-	expected_stderr_string=$1
+	expected_string=$1
 	retcode=$2
 	expected_retcode=$3
 	if [ "$expected_retcode" -a $retcode != $expected_retcode ] ; then
@@ -44,9 +113,8 @@ function check_response()
 		exit 1
 	fi
 
-	if ! grep "$expected_stderr_string" $TMPFILE >/dev/null 2>&1 ; then 
-		echo "Didn't find $expected_stderr_string in stderr output" >&2
-		echo "Stderr: " >&2
+	if ! grep --quiet -- "$expected_string" $TMPFILE ; then 
+		echo "Didn't find $expected_string in output" >&2
 		cat $TMPFILE >&2
 		exit 1
 	fi
@@ -87,6 +155,21 @@ function expect_config_value()
   fi
 }
 
+function test_mon_injectargs()
+{
+  CEPH_ARGS='--mon_debug_dump_location the.dump' ceph tell osd.0 injectargs --no-osd_debug_op_order >& $TMPFILE || return 1
+  check_response "osd_debug_op_order = 'false'"
+  ! grep "the.dump" $TMPFILE || return 1
+  ceph tell osd.0 injectargs '--osd_debug_op_order --osd_failsafe_full_ratio .99' >& $TMPFILE || return 1
+  check_response "osd_debug_op_order = 'true' osd_failsafe_full_ratio = '0.99'"
+  ceph tell osd.0 injectargs --no-osd_debug_op_order >& $TMPFILE || return 1
+  check_response "osd_debug_op_order = 'false'"
+  ceph tell osd.0 injectargs -- --osd_debug_op_order >& $TMPFILE || return 1
+  check_response "osd_debug_op_order = 'true'"
+  ceph tell osd.0 injectargs -- '--osd_debug_op_order --osd_failsafe_full_ratio .98' >& $TMPFILE || return 1
+  check_response "osd_debug_op_order = 'true' osd_failsafe_full_ratio = '0.98'" 
+}
+
 function test_mon_injectargs_SI()
 {
   # Test SI units during injectargs and 'config set'
@@ -111,7 +194,10 @@ function test_mon_injectargs_SI()
   expect_config_value "mon.a" "mon_pg_warn_min_objects" 10240
   ceph tell mon.a injectargs '--mon_pg_warn_min_objects 1G'
   expect_config_value "mon.a" "mon_pg_warn_min_objects" 1073741824
-  expect_false ceph injectargs mon.a '--mon_pg_warn_min_objects 10F'
+  # < /dev/null accounts for the fact that ceph will go in interactive mode
+  # because injectargs is discarded (actually saved for the benefit of 
+  # a tell command that never comes)
+  expect_false ceph injectargs mon.a '--mon_pg_warn_min_objects 10F' < /dev/null 2> /dev/null
   $SUDO ceph daemon mon.a config set mon_pg_warn_min_objects $initial_value
 }
 
@@ -185,6 +271,11 @@ function test_tiering()
   ceph osd tier add slow cache2 --force-nonempty
   ceph osd tier remove slow cache2
 
+  ceph osd pool ls | grep cache2
+  ceph osd pool ls -f json-pretty | grep cache2
+  ceph osd pool ls detail | grep cache2
+  ceph osd pool ls detail -f json-pretty | grep cache2
+
   ceph osd pool delete cache cache --yes-i-really-really-mean-it
   ceph osd pool delete cache2 cache2 --yes-i-really-really-mean-it
 
@@ -193,7 +284,9 @@ function test_tiering()
   ceph osd tier add-cache slow cache3 1024000
   ceph osd dump | grep cache3 | grep bloom | grep 'false_positive_probability: 0.05' | grep 'target_bytes 1024000' | grep '1200s x4'
   ceph osd tier remove slow cache3
+  ceph osd pool ls | grep cache3
   ceph osd pool delete cache3 cache3 --yes-i-really-really-mean-it
+  ! ceph osd pool ls | grep cache3 || exit 1
 
   ceph osd pool delete slow2 slow2 --yes-i-really-really-mean-it
   ceph osd pool delete slow slow --yes-i-really-really-mean-it
@@ -249,19 +342,18 @@ function test_tiering()
   ceph osd dump | grep "pool.*'cache6'" 2>&1 | grep "tier_of[ \t]\+$poolB_id"
 
   ceph osd tier remove basepoolA cache5 2>&1 | grep 'not a tier of'
-  ! ceph osd dump | grep "pool.*'cache5'" 2>&1 | grep "tier_of"
+  ! ceph osd dump | grep "pool.*'cache5'" 2>&1 | grep "tier_of" || exit 1
   ceph osd tier remove basepoolB cache6 2>&1 | grep 'not a tier of'
-  ! ceph osd dump | grep "pool.*'cache6'" 2>&1 | grep "tier_of"
+  ! ceph osd dump | grep "pool.*'cache6'" 2>&1 | grep "tier_of" || exit 1
 
-  ! ceph osd dump | grep "pool.*'basepoolA'" 2>&1 | grep "tiers"
-  ! ceph osd dump | grep "pool.*'basepoolB'" 2>&1 | grep "tiers"
+  ! ceph osd dump | grep "pool.*'basepoolA'" 2>&1 | grep "tiers" || exit 1
+  ! ceph osd dump | grep "pool.*'basepoolB'" 2>&1 | grep "tiers" || exit 1
 
   ceph osd pool delete cache6 cache6 --yes-i-really-really-mean-it
   ceph osd pool delete cache5 cache5 --yes-i-really-really-mean-it
   ceph osd pool delete basepoolB basepoolB --yes-i-really-really-mean-it
   ceph osd pool delete basepoolA basepoolA --yes-i-really-really-mean-it
 }
-
 
 function test_auth()
 {
@@ -285,8 +377,95 @@ function test_auth()
   diff authfile authfile2
   rm authfile authfile2
   ceph auth del client.xx
+  #
+  # get / set auid
+  #
+  local auid=444
+  ceph-authtool --create-keyring --name client.TEST --gen-key --set-uid $auid TEST-keyring
+  ceph auth import --in-file TEST-keyring
+  rm TEST-keyring
+  ceph auth get client.TEST > $TMPFILE
+  check_response "auid = $auid"
+  ceph --format json-pretty auth get client.TEST > $TMPFILE
+  check_response '"auid": '$auid
+  ceph auth list > $TMPFILE
+  check_response "auid: $auid"
+  ceph --format json-pretty auth list > $TMPFILE
+  check_response '"auid": '$auid
+  ceph auth del client.TEST
 }
 
+function test_auth_profiles()
+{
+  ceph auth add client.xx-profile-ro mon 'allow profile read-only'
+  ceph auth add client.xx-profile-rw mon 'allow profile read-write'
+  ceph auth add client.xx-profile-rd mon 'allow profile role-definer'
+
+  ceph auth export > client.xx.keyring
+
+  # read-only is allowed all read-only commands (auth excluded)
+  ceph -n client.xx-profile-ro -k client.xx.keyring status
+  ceph -n client.xx-profile-ro -k client.xx.keyring osd dump
+  ceph -n client.xx-profile-ro -k client.xx.keyring pg dump
+  ceph -n client.xx-profile-ro -k client.xx.keyring mon dump
+  ceph -n client.xx-profile-ro -k client.xx.keyring mds dump
+  # read-only gets access denied for rw commands or auth commands
+  ceph -n client.xx-profile-ro -k client.xx.keyring log foo >& $TMPFILE || true
+  check_response "EACCES: access denied"
+  ceph -n client.xx-profile-ro -k client.xx.keyring osd set noout >& $TMPFILE || true
+  check_response "EACCES: access denied"
+  ceph -n client.xx-profile-ro -k client.xx.keyring auth list >& $TMPFILE || true
+  check_response "EACCES: access denied"
+
+  # read-write is allowed for all read-write commands (except auth)
+  ceph -n client.xx-profile-rw -k client.xx.keyring status
+  ceph -n client.xx-profile-rw -k client.xx.keyring osd dump
+  ceph -n client.xx-profile-rw -k client.xx.keyring pg dump
+  ceph -n client.xx-profile-rw -k client.xx.keyring mon dump
+  ceph -n client.xx-profile-rw -k client.xx.keyring mds dump
+  ceph -n client.xx-profile-rw -k client.xx.keyring log foo
+  ceph -n client.xx-profile-rw -k client.xx.keyring osd set noout
+  ceph -n client.xx-profile-rw -k client.xx.keyring osd unset noout
+  # read-write gets access denied for auth commands
+  ceph -n client.xx-profile-rw -k client.xx.keyring auth list >& $TMPFILE || true
+  check_response "EACCES: access denied"
+
+  # role-definer is allowed RWX 'auth' commands and read-only 'mon' commands
+  ceph -n client.xx-profile-rd -k client.xx.keyring auth list
+  ceph -n client.xx-profile-rd -k client.xx.keyring auth export
+  ceph -n client.xx-profile-rd -k client.xx.keyring auth add client.xx-profile-foo
+  ceph -n client.xx-profile-rd -k client.xx.keyring status
+  ceph -n client.xx-profile-rd -k client.xx.keyring osd dump >& $TMPFILE || true
+  check_response "EACCES: access denied"
+  ceph -n client.xx-profile-rd -k client.xx.keyring pg dump >& $TMPFILE || true
+  check_response "EACCES: access denied"
+  # read-only 'mon' subsystem commands are allowed
+  ceph -n client.xx-profile-rd -k client.xx.keyring mon dump
+  # but read-write 'mon' commands are not
+  ceph -n client.xx-profile-rd -k client.xx.keyring mon add foo 1.1.1.1 >& $TMPFILE || true
+  check_response "EACCES: access denied"
+  ceph -n client.xx-profile-rd -k client.xx.keyring mds dump >& $TMPFILE || true
+  check_response "EACCES: access denied"
+  ceph -n client.xx-profile-rd -k client.xx.keyring log foo >& $TMPFILE || true
+  check_response "EACCES: access denied"
+  ceph -n client.xx-profile-rd -k client.xx.keyring osd set noout >& $TMPFILE || true
+  check_response "EACCES: access denied"
+
+  ceph -n client.xx-profile-rd -k client.xx.keyring auth del client.xx-profile-ro
+  ceph -n client.xx-profile-rd -k client.xx.keyring auth del client.xx-profile-rw
+  
+  # add a new role-definer with the existing role-definer
+  ceph -n client.xx-profile-rd -k client.xx.keyring \
+    auth add client.xx-profile-rd2 mon 'allow profile role-definer'
+  ceph -n client.xx-profile-rd -k client.xx.keyring \
+    auth export > client.xx.keyring.2
+  # remove old role-definer using the new role-definer
+  ceph -n client.xx-profile-rd2 -k client.xx.keyring.2 \
+    auth del client.xx-profile-rd
+  # remove the remaining role-definer with admin
+  ceph auth del client.xx-profile-rd2
+  rm -f client.xx.keyring client.xx.keyring.2
+}
 
 function test_mon_misc()
 {
@@ -330,29 +509,119 @@ function test_mon_misc()
 }
 
 
+function check_mds_active()
+{
+    ceph mds dump | grep active
+}
+
+function wait_mds_active()
+{
+  for i in $(seq 1 300) ; do
+      if ! check_mds_active ; then
+          echo "waiting for an active MDS daemon"
+          sleep 5
+      else
+          break
+      fi
+  done
+  check_mds_active
+}
+
+function get_mds_gids()
+{
+    ceph mds dump --format=json | python -c "import json; import sys; print ' '.join([m['gid'].__str__() for m in json.load(sys.stdin)['info'].values()])"
+}
+
 function fail_all_mds()
 {
   ceph mds cluster_down
-  mds_gids=`ceph mds dump | grep up: | while read line ; do echo $line | awk '{print substr($1, 0, length($1)-1);}' ; done`
+  mds_gids=$(get_mds_gids)
   for mds_gid in $mds_gids ; do
       ceph mds fail $mds_gid
   done
+  if check_mds_active ; then
+      echo "An active MDS remains, something went wrong"
+      ceph mds dump
+      exit -1
+  fi
+
 }
 
-function test_mon_mds()
+function remove_all_fs()
 {
-  existing_fs=$(ceph fs ls | grep "name:" | awk '{print substr($2,0,length($2)-1);}')
-  num_mds=$(ceph mds stat | awk '{print $2;}' | cut -f1 -d'/')
+  existing_fs=$(ceph fs ls --format=json | python -c "import json; import sys; print ' '.join([fs['name'] for fs in json.load(sys.stdin)])")
   if [ -n "$existing_fs" ] ; then
       fail_all_mds
       echo "Removing existing filesystem '${existing_fs}'..."
       ceph fs rm $existing_fs --yes-i-really-mean-it
       echo "Removed '${existing_fs}'."
   fi
+}
+
+# So that tests requiring MDS can skip if one is not configured
+# in the cluster at all
+function mds_exists()
+{
+    ceph auth list | grep "^mds"
+}
+
+function test_mds_tell()
+{
+  if ! mds_exists ; then
+      echo "Skipping test, no MDS found"
+      return
+  fi
+
+  remove_all_fs
+  ceph osd pool create fs_data 10
+  ceph osd pool create fs_metadata 10
+  ceph fs new cephfs fs_metadata fs_data
+  wait_mds_active
+
+  # Test injectargs by GID
+  old_mds_gids=$(get_mds_gids)
+  echo Old GIDs: $old_mds_gids
+
+  for mds_gid in $old_mds_gids ; do
+      ceph tell mds.$mds_gid injectargs "--debug-mds 20"
+  done
+
+  # Test respawn by rank
+  ceph tell mds.0 respawn
+  new_mds_gids=$old_mds_gids
+  while [ $new_mds_gids -eq $old_mds_gids ] ; do
+      sleep 5
+      new_mds_gids=$(get_mds_gids)
+  done
+  echo New GIDs: $new_mds_gids
+
+  # Test respawn by ID
+  ceph tell mds.a respawn
+  new_mds_gids=$old_mds_gids
+  while [ $new_mds_gids -eq $old_mds_gids ] ; do
+      sleep 5
+      new_mds_gids=$(get_mds_gids)
+  done
+  echo New GIDs: $new_mds_gids
+
+  remove_all_fs
+  ceph osd pool delete fs_data fs_data --yes-i-really-really-mean-it
+  ceph osd pool delete fs_metadata fs_metadata --yes-i-really-really-mean-it
+}
+
+function test_mon_mds()
+{
+  remove_all_fs
 
   ceph osd pool create fs_data 10
   ceph osd pool create fs_metadata 10
   ceph fs new cephfs fs_metadata fs_data
+
+  ceph mds cluster_down
+  ceph mds cluster_up
+
+  ceph mds compat rm_incompat 4
+  ceph mds compat rm_incompat 4
 
   # We don't want any MDSs to be up, their activity can interfere with
   # the "current_epoch + 1" checking below if they're generating updates
@@ -361,12 +630,6 @@ function test_mon_mds()
   # Check for default crash_replay_interval set automatically in 'fs new'
   ceph osd dump | grep fs_data > $TMPFILE
   check_response "crash_replay_interval 45 "
-
-  ceph mds cluster_down
-  ceph mds cluster_up
-
-  ceph mds compat rm_incompat 4
-  ceph mds compat rm_incompat 4
 
   ceph mds compat show
   expect_false ceph mds deactivate 2
@@ -385,6 +648,10 @@ function test_mon_mds()
   data3_pool=$(ceph osd dump | grep 'pool.*data3' | awk '{print $2;}')
   ceph mds add_data_pool $data2_pool
   ceph mds add_data_pool $data3_pool
+  ceph mds add_data_pool 100 >& $TMPFILE || true
+  check_response "Error ENOENT"
+  ceph mds add_data_pool foobarbaz >& $TMPFILE || true
+  check_response "Error ENOENT"
   ceph mds remove_data_pool $data2_pool
   ceph mds remove_data_pool $data3_pool
   ceph osd pool delete data2 data2 --yes-i-really-really-mean-it
@@ -462,6 +729,7 @@ function test_mon_mds()
   check_response 'in use by CephFS' $? 16
   set -e
 
+  fail_all_mds
   ceph fs rm cephfs --yes-i-really-mean-it
 
   # ... but we should be forbidden from using the cache pool in the FS directly.
@@ -494,8 +762,24 @@ function test_mon_mds()
   check_response 'in use by CephFS' $? 16
   set -e
 
+  fail_all_mds
   ceph fs rm cephfs --yes-i-really-mean-it
 
+  # Create a FS and check that we can subsequently add a cache tier to it
+  ceph fs new cephfs fs_metadata fs_data
+
+  # Adding overlay to FS pool should be permitted, RADOS clients handle this.
+  ceph osd tier add fs_metadata mds-tier
+  ceph osd tier cache-mode mds-tier writeback
+  ceph osd tier set-overlay fs_metadata mds-tier
+
+  # Clean up FS
+  fail_all_mds
+  ceph fs rm cephfs --yes-i-really-mean-it
+
+  # Clean up overlay/tier relationship
+  ceph osd tier remove-overlay fs_metadata
+  ceph osd tier remove fs_metadata mds-tier
 
   ceph osd pool delete mds-tier mds-tier --yes-i-really-really-mean-it
   ceph osd pool delete mds-ec-pool mds-ec-pool --yes-i-really-really-mean-it
@@ -544,12 +828,18 @@ function test_mon_osd()
   #
   # osd crush
   #
+  ceph osd crush reweight-all
   ceph osd crush tunables legacy
   ceph osd crush show-tunables | grep argonaut
   ceph osd crush tunables bobtail
   ceph osd crush show-tunables | grep bobtail
   ceph osd crush tunables firefly
   ceph osd crush show-tunables | grep firefly
+
+  ceph osd crush set-tunable straw_calc_version 0
+  ceph osd crush get-tunable straw_calc_version | grep 0
+  ceph osd crush set-tunable straw_calc_version 1
+  ceph osd crush get-tunable straw_calc_version | grep 1
 
   #
   # osd scrub
@@ -559,7 +849,7 @@ function test_mon_osd()
   ceph osd deep-scrub 0
   ceph osd repair 0
 
-  for f in noup nodown noin noout noscrub nodeep-scrub nobackfill norecover notieragent
+  for f in noup nodown noin noout noscrub nodeep-scrub nobackfill norecover notieragent full
   do
     ceph osd set $f
     ceph osd unset $f
@@ -581,27 +871,13 @@ function test_mon_osd()
   done
   ceph osd dump | grep 'osd.0 up'
 
-  ceph osd thrash 10
-  ceph osd down `seq 0 31`  # force everything down so that we can trust up
-  # make sure everything gets back up+in.
-  for ((i=0; i < 100; i++)); do
-    if ceph osd dump | grep ' down '; then
-      echo "waiting for osd(s) to come back up"
-      sleep 10
-    else
-      break
-    fi
-  done
-  ! ceph osd dump | grep ' down '
-  
-  # if you have more osds than this you are on your own
-  for f in `seq 0 31`; do
-    ceph osd in $f || true
-  done
+  ceph osd thrash 0
 
   ceph osd dump | grep 'osd.0 up'
   ceph osd find 1
+  ceph --format plain osd find 1 # falls back to json-pretty
   ceph osd metadata 1 | grep 'distro'
+  ceph --format plain osd metadata 1 | grep 'distro' # falls back to json-pretty
   ceph osd out 0
   ceph osd dump | grep 'osd.0.*out'
   ceph osd in 0
@@ -622,15 +898,19 @@ function test_mon_osd()
   ceph osd getmaxosd | grep "max_osd = $save"
 
   for id in `ceph osd ls` ; do
-    ceph tell osd.$id version
+    retry_eagain 5 map_enxio_to_eagain ceph tell osd.$id version
   done
 
   ceph osd rm 0 2>&1 | grep 'EBUSY'
 
+  local old_osds=$(echo $(ceph osd ls))
   id=`ceph osd create`
   ceph osd lost $id --yes-i-really-mean-it
   expect_false ceph osd setmaxosd $id
-  ceph osd rm $id
+  local new_osds=$(echo $(ceph osd ls))
+  for id in $(echo $new_osds | sed -e "s/$old_osds//") ; do
+      ceph osd rm $id
+  done
 
   uuid=`uuidgen`
   id=`ceph osd create $uuid`
@@ -1040,24 +1320,31 @@ function test_osd_bench()
 #
 
 set +x
-TESTS=(
-  mon_injectargs_SI
-  tiering
-  auth
-  mon_misc
-  mon_mds
-  mon_mon
-  mon_osd
-  mon_osd_pool
-  mon_osd_pool_quota
-  mon_pg
-  mon_osd_pool_set
-  mon_osd_tiered_pool_set
-  mon_osd_erasure_code
-  mon_osd_misc
-  mon_heap_profiler
-  osd_bench
-)
+MON_TESTS+=" mon_injectargs"
+MON_TESTS+=" mon_injectargs_SI"
+MON_TESTS+=" tiering"
+MON_TESTS+=" auth"
+MON_TESTS+=" auth_profiles"
+MON_TESTS+=" mon_misc"
+MON_TESTS+=" mon_mon"
+MON_TESTS+=" mon_osd"
+MON_TESTS+=" mon_osd_pool"
+MON_TESTS+=" mon_osd_pool_quota"
+MON_TESTS+=" mon_pg"
+MON_TESTS+=" mon_osd_pool_set"
+MON_TESTS+=" mon_osd_tiered_pool_set"
+MON_TESTS+=" mon_osd_erasure_code"
+MON_TESTS+=" mon_osd_misc"
+MON_TESTS+=" mon_heap_profiler"
+
+OSD_TESTS+=" osd_bench"
+
+MDS_TESTS+=" mds_tell"
+MDS_TESTS+=" mon_mds"
+
+TESTS+=$MON_TESTS
+TESTS+=$OSD_TESTS
+TESTS+=$MDS_TESTS
 
 #
 # "main" follows
@@ -1066,7 +1353,7 @@ TESTS=(
 function list_tests()
 {
   echo "AVAILABLE TESTS"
-  for i in ${TESTS[@]}; do
+  for i in $TESTS; do
     echo "  $i"
   done
 }
@@ -1078,6 +1365,8 @@ function usage()
 
 tests_to_run=()
 
+sanity_check=true
+
 while [[ $# -gt 0 ]]; do
   opt=$1
 
@@ -1088,6 +1377,18 @@ while [[ $# -gt 0 ]]; do
     "--asok-does-not-need-root" )
       SUDO=""
       ;;
+    "--no-sanity-check" )
+      sanity_check=false
+      ;;
+    "--test-mon" )
+      tests_to_run+="$MON_TESTS"
+      ;;
+    "--test-osd" )
+      tests_to_run+="$OSD_TESTS"
+      ;;
+    "--test-mds" )
+      tests_to_run+="$MDS_TESTS"
+      ;;
     "-t" )
       shift
       if [[ -z "$1" ]]; then
@@ -1095,7 +1396,7 @@ while [[ $# -gt 0 ]]; do
         usage ;
         exit 1
       fi
-      tests_to_run=("${tests_to_run[@]}" "$1")
+      tests_to_run+=" $1"
       ;;
     "-h" )
       usage ;
@@ -1110,15 +1411,24 @@ if [[ $do_list -eq 1 ]]; then
   exit 0
 fi
 
-if [[ ${#tests_to_run[@]} -eq 0 ]]; then
-  tests_to_run=("${TESTS[@]}")
+if test -z "$tests_to_run" ; then
+  tests_to_run="$TESTS"
 fi
 
-for i in ${tests_to_run[@]}; do
+if $sanity_check ; then
+    wait_no_osd_down
+fi
+for i in $tests_to_run; do
+  if $sanity_check ; then
+      check_no_osd_down
+  fi
   set -x
-  test_${i} ;
+  test_${i}
   set +x
 done
+if $sanity_check ; then
+    check_no_osd_down
+fi
 
 set -x
 

@@ -155,6 +155,10 @@ public:
 
     string cluster_snapshot;
 
+    mutable bool have_crc;      ///< crc values are defined
+    uint32_t full_crc;  ///< crc of the resulting OSDMap
+    mutable uint32_t inc_crc;   ///< crc of this incremental
+
     int get_net_marked_out(const OSDMap *previous) const;
     int get_net_marked_down(const OSDMap *previous) const;
     int identify_osd(uuid_d u) const;
@@ -169,7 +173,8 @@ public:
 
     Incremental(epoch_t e=0) :
       encode_features(0),
-      epoch(e), new_pool_max(-1), new_flags(-1), new_max_osd(-1) {
+      epoch(e), new_pool_max(-1), new_flags(-1), new_max_osd(-1),
+      have_crc(false), full_crc(0), inc_crc(0) {
       memset(&fsid, 0, sizeof(fsid));
     }
     Incremental(bufferlist &bl) {
@@ -240,7 +245,13 @@ private:
   string cluster_snapshot;
   bool new_blacklist_entries;
 
+  mutable bool crc_defined;
+  mutable uint32_t crc;
+
  public:
+  bool have_crc() const { return crc_defined; }
+  uint32_t get_crc() const { return crc; }
+
   ceph::shared_ptr<CrushWrapper> crush;       // hierarchical map
 
   friend class OSDMonitor;
@@ -258,6 +269,7 @@ private:
 	     osd_uuid(new vector<uuid_d>),
 	     cluster_snapshot_epoch(0),
 	     new_blacklist_entries(false),
+	     crc_defined(false), crc(0),
 	     crush(new CrushWrapper) {
     memset(&fsid, 0, sizeof(fsid));
   }
@@ -672,19 +684,18 @@ public:
     if (i == get_pools().end()) {
       return false;
     }
+    if (!i->second.ec_pool()) {
+      *out = spg_t(pgid);
+      return true;
+    }
     int primary;
     vector<int> acting;
     pg_to_acting_osds(pgid, &acting, &primary);
-    if (i->second.ec_pool()) {
-      for (uint8_t i = 0; i < acting.size(); ++i) {
-	if (acting[i] == primary) {
-	  *out = spg_t(pgid, shard_id_t(i));
-	  return true;
-	}
+    for (uint8_t i = 0; i < acting.size(); ++i) {
+      if (acting[i] == primary) {
+        *out = spg_t(pgid, shard_id_t(i));
+        return true;
       }
-    } else {
-      *out = spg_t(pgid);
-      return true;
     }
     return false;
   }
@@ -771,6 +782,18 @@ public:
     return calc_pg_role(osd, group, nrep);
   }
 
+  bool osd_is_valid_op_target(pg_t pg, int osd) const {
+    int primary;
+    vector<int> group;
+    int nrep = pg_to_acting_osds(pg, &group, &primary);
+    if (osd == primary)
+      return true;
+    if (pg_is_ec(pg))
+      return false;
+
+    return calc_pg_role(osd, group, nrep) >= 0;
+  }
+
 
   /*
    * handy helpers to build simple maps...
@@ -810,6 +833,7 @@ private:
   void print_osd_line(int cur, ostream *out, Formatter *f) const;
 public:
   void print(ostream& out) const;
+  void print_pools(ostream& out) const;
   void print_summary(Formatter *f, ostream& out) const;
   void print_oneline_summary(ostream& out) const;
   void print_tree(ostream *out, Formatter *f) const;

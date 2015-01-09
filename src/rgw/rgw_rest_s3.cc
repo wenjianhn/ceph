@@ -164,7 +164,7 @@ done:
   dump_errno(s);
 
   for (riter = response_attrs.begin(); riter != response_attrs.end(); ++riter) {
-    s->cio->print("%s: %s\n", riter->first.c_str(), riter->second.c_str());
+    s->cio->print("%s: %s\r\n", riter->first.c_str(), riter->second.c_str());
   }
 
   if (!content_type)
@@ -277,7 +277,7 @@ void RGWListBucket_ObjStore_S3::send_response()
       dump_owner(s, iter->owner, iter->owner_display_name);
       s->formatter->close_section();
     }
-    if (common_prefixes.size() > 0) {
+    if (!common_prefixes.empty()) {
       map<string, bool>::iterator pref_iter;
       for (pref_iter = common_prefixes.begin(); pref_iter != common_prefixes.end(); ++pref_iter) {
         s->formatter->open_array_section("CommonPrefixes");
@@ -323,9 +323,9 @@ static void dump_bucket_metadata(struct req_state *s, RGWBucketEnt& bucket)
 {
   char buf[32];
   snprintf(buf, sizeof(buf), "%lld", (long long)bucket.count);
-  s->cio->print("X-RGW-Object-Count: %s\n", buf);
+  s->cio->print("X-RGW-Object-Count: %s\r\n", buf);
   snprintf(buf, sizeof(buf), "%lld", (long long)bucket.size);
-  s->cio->print("X-RGW-Bytes-Used: %s\n", buf);
+  s->cio->print("X-RGW-Bytes-Used: %s\r\n", buf);
 }
 
 void RGWStatBucket_ObjStore_S3::send_response()
@@ -512,6 +512,9 @@ int RGWPutObj_ObjStore_S3::get_params()
     return r;
 
   policy = s3policy;
+
+  if_match = s->info.env->get("HTTP_IF_MATCH");
+  if_nomatch = s->info.env->get("HTTP_IF_NONE_MATCH");
 
   return RGWPutObj_ObjStore::get_params();
 }
@@ -1284,7 +1287,7 @@ void RGWCopyObj_ObjStore_S3::send_partial_response(off_t ofs)
     set_req_state_err(s, ret);
     dump_errno(s);
 
-    end_header(s, this, "binary/octet-stream");
+    end_header(s, this, "application/xml");
     if (ret == 0) {
       s->formatter->open_object_section("CopyObjectResult");
     }
@@ -1305,13 +1308,8 @@ void RGWCopyObj_ObjStore_S3::send_response()
 
   if (ret == 0) {
     dump_time(s, "LastModified", &mtime);
-    map<string, bufferlist>::iterator iter = attrs.find(RGW_ATTR_ETAG);
-    if (iter != attrs.end()) {
-      bufferlist& bl = iter->second;
-      if (bl.length()) {
-        char *etag = bl.c_str();
-        s->formatter->dump_string("ETag", etag);
-      }
+    if (!etag.empty()) {
+      s->formatter->dump_string("ETag", etag);
     }
     s->formatter->close_section();
     rgw_flush_formatter_and_reset(s, s->formatter);
@@ -1640,7 +1638,7 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
       dump_time(s, "Initiated", &mtime);
       s->formatter->close_section();
     }
-    if (common_prefixes.size() > 0) {
+    if (!common_prefixes.empty()) {
       s->formatter->open_array_section("CommonPrefixes");
       map<string, bool>::iterator pref_iter;
       for (pref_iter = common_prefixes.begin(); pref_iter != common_prefixes.end(); ++pref_iter) {
@@ -2142,7 +2140,18 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
     } else {
       keystone_result = keystone_validator.validate_s3token(auth_id, token, auth_sign);
       if (keystone_result == 0) {
-        s->user.user_id = keystone_validator.response.token.tenant.id;
+	// Check for time skew first
+	time_t req_sec = s->header_time.sec();
+
+	if ((req_sec < now - RGW_AUTH_GRACE_MINS * 60 ||
+	     req_sec > now + RGW_AUTH_GRACE_MINS * 60) && !qsr) {
+	  dout(10) << "req_sec=" << req_sec << " now=" << now << "; now - RGW_AUTH_GRACE_MINS=" << now - RGW_AUTH_GRACE_MINS * 60 << "; now + RGW_AUTH_GRACE_MINS=" << now + RGW_AUTH_GRACE_MINS * 60 << dendl;
+	  dout(0) << "NOTICE: request time skew too big now=" << utime_t(now, 0) << " req_time=" << s->header_time << dendl;
+	  return -ERR_REQUEST_TIME_SKEWED;
+	}
+
+
+	s->user.user_id = keystone_validator.response.token.tenant.id;
         s->user.display_name = keystone_validator.response.token.tenant.name; // wow.
 
         /* try to store user if it not already exists */
@@ -2167,7 +2176,7 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
     /* get the user info */
     if (rgw_get_user_info_by_access_key(store, auth_id, s->user) < 0) {
       dout(5) << "error reading user info, uid=" << auth_id << " can't authenticate" << dendl;
-      return -EPERM;
+      return -ERR_INVALID_ACCESS_KEY;
     }
 
     /* now verify signature */
@@ -2215,8 +2224,9 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
     dout(15) << "auth_sign=" << auth_sign << dendl;
     dout(15) << "compare=" << auth_sign.compare(digest) << dendl;
 
-    if (auth_sign != digest)
-      return -EPERM;
+    if (auth_sign != digest) {
+      return -ERR_SIGNATURE_NO_MATCH;
+    }
 
     if (s->user.system) {
       s->system_request = true;

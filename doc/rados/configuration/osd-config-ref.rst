@@ -90,6 +90,34 @@ that Ceph uses the entire partition for the journal.
 :Default: ``$libdir/rados-classes``
 
 
+.. index:: OSD; file system
+
+File System Settings
+====================
+Ceph builds and mounts file systems which are used for Ceph OSDs.
+
+``osd mkfs options {fs-type}`` 
+
+:Description: Options used when creating a new Ceph OSD of type {fs-type}.
+
+:Type: String
+:Default for xfs: ``-f -i 2048``
+:Default for other file systems: {empty string}
+
+For example::
+  ``osd mkfs options xfs = -f -d agcount=24``
+
+``osd mount options {fs-type}`` 
+
+:Description: Options used when mounting a Ceph OSD of type {fs-type}.
+
+:Type: String
+:Default for xfs: ``rw,noatime,inode64``
+:Default for other file systems: ``rw, noatime``
+
+For example::
+  ``osd mount options xfs = rw, noatime, inode64, nobarrier, logbufs=8``
+
 
 .. index:: OSD; journal settings
 
@@ -320,10 +348,10 @@ recovery operations to ensure optimal performance during recovery.
 :Type: 32-bit Integer
 :Default: ``1`` 
 
-``disk thread ioprio class``
+``osd disk thread ioprio class``
 
-:Description: Warning: it will only be used if both ``disk thread
-	      ioprio class`` and ``disk thread ioprio priority`` are
+:Description: Warning: it will only be used if both ``osd disk thread
+	      ioprio class`` and ``osd disk thread ioprio priority`` are
 	      set to a non default value.  Sets the ioprio_set(2) I/O
 	      scheduling ``class`` for the disk thread. Acceptable
 	      values are ``idle``, ``be`` or ``rt``. The ``idle``
@@ -340,10 +368,10 @@ recovery operations to ensure optimal performance during recovery.
 :Type: String
 :Default: the empty string
 
-``disk thread ioprio priority``
+``osd disk thread ioprio priority``
 
-:Description: Warning: it will only be used if both ``disk thread
-	      ioprio class`` and ``disk thread ioprio priority`` are
+:Description: Warning: it will only be used if both ``osd disk thread
+	      ioprio class`` and ``osd disk thread ioprio priority`` are
 	      set to a non default value. It sets the ioprio_set(2)
 	      I/O scheduling ``priority`` of the disk thread ranging
 	      from 0 (highest) to 7 (lowest). If all OSDs on a given

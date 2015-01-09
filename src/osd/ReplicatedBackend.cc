@@ -158,6 +158,7 @@ bool ReplicatedBackend::handle_message(
       }
     } else {
       sub_op_modify(op);
+      return true;
     }
     break;
   }
@@ -174,6 +175,7 @@ bool ReplicatedBackend::handle_message(
       }
     } else {
       sub_op_modify_reply(op);
+      return true;
     }
     break;
   }
@@ -223,9 +225,10 @@ int ReplicatedBackend::objects_read_sync(
   const hobject_t &hoid,
   uint64_t off,
   uint64_t len,
+  uint32_t op_flags,
   bufferlist *bl)
 {
-  return store->read(coll, hoid, off, len, *bl);
+  return store->read(coll, hoid, off, len, *bl, op_flags);
 }
 
 struct AsyncReadCallback : public GenContext<ThreadPool::TPHandle&> {
@@ -242,18 +245,19 @@ struct AsyncReadCallback : public GenContext<ThreadPool::TPHandle&> {
 };
 void ReplicatedBackend::objects_read_async(
   const hobject_t &hoid,
-  const list<pair<pair<uint64_t, uint64_t>,
+  const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 		  pair<bufferlist*, Context*> > > &to_read,
   Context *on_complete)
 {
   int r = 0;
-  for (list<pair<pair<uint64_t, uint64_t>,
+  for (list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 		 pair<bufferlist*, Context*> > >::const_iterator i =
 	   to_read.begin();
        i != to_read.end() && r >= 0;
        ++i) {
-    int _r = store->read(coll, hoid, i->first.first,
-			 i->first.second, *(i->second.first));
+    int _r = store->read(coll, hoid, i->first.get<0>(),
+			 i->first.get<1>(), *(i->second.first),
+			 i->first.get<2>());
     if (i->second.second) {
       get_parent()->schedule_recovery_work(
 	get_parent()->bless_gencontext(
@@ -274,6 +278,7 @@ class RPGTransaction : public PGBackend::PGTransaction {
   set<hobject_t> temp_added;
   set<hobject_t> temp_cleared;
   ObjectStore::Transaction *t;
+  uint64_t written;
   const coll_t &get_coll_ct(const hobject_t &hoid) {
     if (hoid.is_temp()) {
       temp_cleared.erase(hoid);
@@ -296,7 +301,7 @@ class RPGTransaction : public PGBackend::PGTransaction {
   }
 public:
   RPGTransaction(coll_t coll, coll_t temp_coll)
-    : coll(coll), temp_coll(temp_coll), t(new ObjectStore::Transaction)
+    : coll(coll), temp_coll(temp_coll), t(new ObjectStore::Transaction), written(0)
     {}
 
   /// Yields ownership of contained transaction
@@ -316,9 +321,11 @@ public:
     const hobject_t &hoid,
     uint64_t off,
     uint64_t len,
-    bufferlist &bl
+    bufferlist &bl,
+    uint32_t fadvise_flags
     ) {
-    t->write(get_coll_ct(hoid), hoid, off, len, bl);
+    written += len;
+    t->write(get_coll_ct(hoid), hoid, off, len, bl, fadvise_flags);
   }
   void remove(
     const hobject_t &hoid
@@ -355,6 +362,8 @@ public:
     const hobject_t &hoid,
     map<string, bufferlist> &keys
     ) {
+    for (map<string, bufferlist>::iterator p = keys.begin(); p != keys.end(); ++p)
+      written += p->first.length() + p->second.length();
     return t->omap_setkeys(get_coll(hoid), hoid, keys);
   }
   void omap_rmkeys(
@@ -372,6 +381,7 @@ public:
     const hobject_t &hoid,
     bufferlist &header
     ) {
+    written += header.length();
     t->omap_setheader(get_coll(hoid), hoid, header);
   }
   void clone_range(
@@ -436,6 +446,8 @@ public:
     ) {
     RPGTransaction *to_append = dynamic_cast<RPGTransaction*>(_to_append);
     assert(to_append);
+    written += to_append->written;
+    to_append->written = 0;
     t->append(*(to_append->t));
     for (set<hobject_t>::iterator i = to_append->temp_added.begin();
 	 i != to_append->temp_added.end();
@@ -457,7 +469,7 @@ public:
     return t->empty();
   }
   uint64_t get_bytes_written() const {
-    return t->get_encoded_bytes();
+    return written;
   }
   ~RPGTransaction() { delete t; }
 };
@@ -617,7 +629,7 @@ void ReplicatedBackend::op_commit(
 void ReplicatedBackend::sub_op_modify_reply(OpRequestRef op)
 {
   MOSDSubOpReply *r = static_cast<MOSDSubOpReply*>(op->get_req());
-  assert(r->get_header().type == MSG_OSD_SUBOPREPLY);
+  assert(r->get_type() == MSG_OSD_SUBOPREPLY);
 
   op->mark_started();
 

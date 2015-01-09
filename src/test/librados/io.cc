@@ -1,6 +1,8 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*
 // vim: ts=8 sw=2 smarttab
 
+#include <climits>
+
 #include "include/rados/librados.h"
 #include "include/rados/librados.hpp"
 #include "test/librados/test.h"
@@ -23,6 +25,18 @@ TEST_F(LibRadosIo, SimpleWrite) {
   ASSERT_EQ(0, rados_write(ioctx, "foo", buf, sizeof(buf), 0));
   rados_ioctx_set_namespace(ioctx, "nspace");
   ASSERT_EQ(0, rados_write(ioctx, "foo", buf, sizeof(buf), 0));
+}
+
+TEST_F(LibRadosIo, TooBig) {
+  char buf[1];
+  ASSERT_EQ(-E2BIG, rados_write(ioctx, "A", buf, UINT_MAX, 0));
+  ASSERT_EQ(-E2BIG, rados_append(ioctx, "A", buf, UINT_MAX));
+  ASSERT_EQ(-E2BIG, rados_write_full(ioctx, "A", buf, UINT_MAX));
+  IoCtx ioctx;
+  bufferlist bl;
+  ASSERT_EQ(-E2BIG, ioctx.write("foo", bl, UINT_MAX, 0));
+  ASSERT_EQ(-E2BIG, ioctx.append("foo", bl, UINT_MAX));
+  // ioctx.write_full no way to overflow bl.length()
 }
 
 TEST_F(LibRadosIo, ReadTimeout) {
@@ -231,6 +245,22 @@ TEST_F(LibRadosIoPP, RoundTripPP) {
   ASSERT_EQ(0, memcmp(buf, cl.c_str(), sizeof(buf)));
 }
 
+TEST_F(LibRadosIoPP, RoundTripPP2)
+{
+  bufferlist bl;
+  bl.append("ceph");
+  ObjectWriteOperation write;
+  write.write(0, bl);
+  write.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED);
+  ASSERT_EQ(0, ioctx.operate("foo", &write));
+
+  ObjectReadOperation read;
+  read.read(0, bl.length(), NULL, NULL);
+  read.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED|LIBRADOS_OP_FLAG_FADVISE_RANDOM);
+  ASSERT_EQ(0, ioctx.operate("foo", &read, &bl));
+  ASSERT_EQ(0, memcmp(bl.c_str(), "ceph", 4));
+}
+
 TEST_F(LibRadosIo, OverlappingWriteRoundTrip) {
   char buf[128];
   char buf2[64];
@@ -289,6 +319,22 @@ TEST_F(LibRadosIoPP, WriteFullRoundTripPP) {
   bufferlist bl3;
   ASSERT_EQ((int)sizeof(buf2), ioctx.read("foo", bl3, sizeof(buf), 0));
   ASSERT_EQ(0, memcmp(bl3.c_str(), buf2, sizeof(buf2)));
+}
+
+TEST_F(LibRadosIoPP, WriteFullRoundTripPP2)
+{
+  bufferlist bl;
+  bl.append("ceph");
+  ObjectWriteOperation write;
+  write.write_full(bl);
+  write.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED);
+  ASSERT_EQ(0, ioctx.operate("foo", &write));
+
+  ObjectReadOperation read;
+  read.read(0, bl.length(), NULL, NULL);
+  read.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED|LIBRADOS_OP_FLAG_FADVISE_RANDOM);
+  ASSERT_EQ(0, ioctx.operate("foo", &read, &bl));
+  ASSERT_EQ(0, memcmp(bl.c_str(), "ceph", 4));
 }
 
 TEST_F(LibRadosIo, AppendRoundTrip) {
@@ -665,6 +711,22 @@ TEST_F(LibRadosIoECPP, RoundTripPP) {
   ASSERT_EQ(0, memcmp(buf, cl.c_str(), sizeof(buf)));
 }
 
+TEST_F(LibRadosIoECPP, RoundTripPP2)
+{
+  bufferlist bl;
+  bl.append("ceph");
+  ObjectWriteOperation write;
+  write.write(0, bl);
+  write.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED);
+  ASSERT_EQ(0, ioctx.operate("foo", &write));
+
+  ObjectReadOperation read;
+  read.read(0, bl.length(), NULL, NULL);
+  read.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED|LIBRADOS_OP_FLAG_FADVISE_RANDOM);
+  ASSERT_EQ(0, ioctx.operate("foo", &read, &bl));
+  ASSERT_EQ(0, memcmp(bl.c_str(), "ceph", 4));
+}
+
 TEST_F(LibRadosIoEC, OverlappingWriteRoundTrip) {
   int bsize = alignment;
   int dbsize = bsize * 2;
@@ -734,6 +796,22 @@ TEST_F(LibRadosIoECPP, WriteFullRoundTripPP) {
   bufferlist bl3;
   ASSERT_EQ((int)sizeof(buf2), ioctx.read("foo", bl3, sizeof(buf), 0));
   ASSERT_EQ(0, memcmp(bl3.c_str(), buf2, sizeof(buf2)));
+}
+
+TEST_F(LibRadosIoECPP, WriteFullRoundTripPP2)
+{
+  bufferlist bl;
+  bl.append("ceph");
+  ObjectWriteOperation write;
+  write.write_full(bl);
+  write.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED);
+  ASSERT_EQ(0, ioctx.operate("foo", &write));
+
+  ObjectReadOperation read;
+  read.read(0, bl.length(), NULL, NULL);
+  read.set_op_flags2(LIBRADOS_OP_FLAG_FADVISE_DONTNEED|LIBRADOS_OP_FLAG_FADVISE_RANDOM);
+  ASSERT_EQ(0, ioctx.operate("foo", &read, &bl));
+  ASSERT_EQ(0, memcmp(bl.c_str(), "ceph", 4));
 }
 
 TEST_F(LibRadosIoEC, AppendRoundTrip) {

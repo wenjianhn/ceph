@@ -67,7 +67,7 @@ usage=$usage"\t-x enable cephx (on by default)\n"
 usage=$usage"\t-X disable cephx\n"
 usage=$usage"\t--hitset <pool> <hit_set_type>: enable hitset tracking\n"
 usage=$usage"\t-e : create an erasure pool\n";
-usage=$usage"\t-o config\t\t add extra config parameters to mds section\n"
+usage=$usage"\t-o config\t\t add extra config parameters to all sections\n"
 usage=$usage"\t-J no journal\t\tdisable filestore journal\n"
 
 
@@ -281,7 +281,7 @@ test -d gmon && $SUDO rm -rf gmon/*
 
 
 # figure machine's ip
-HOSTNAME=`hostname`
+HOSTNAME=`hostname -s`
 if [ -n "$ip" ]; then
     IP="$ip"
 else
@@ -338,6 +338,10 @@ if [ "$start_mon" -eq 1 ]; then
         osd pgp bits = 5  ; (invalid, but ceph should cope!)
         osd crush chooseleaf type = 0
         osd pool default min size = 1
+        osd failsafe full ratio = .99
+        mon osd full ratio = .99
+        mon data avail warn = 10
+        mon data avail crit = 1
         osd pool default erasure code directory = .libs
         osd pool default erasure code profile = plugin=jerasure technique=reed_sol_van k=2 m=1 ruleset-failure-domain=osd
         rgw frontends = fastcgi, civetweb port=$CEPH_RGW_PORT
@@ -394,7 +398,7 @@ $COSDDEBUG
 $COSDMEMSTORE
 $extra_conf
 [mon]
-        mon pg warn min per osd = 10
+        mon pg warn min per osd = 3
         mon osd allow primary affinity = true
         mon reweight min pgs per osd = 4
 $DAEMONOPTS
@@ -419,7 +423,7 @@ EOF
 	        $SUDO $CEPH_BIN/ceph-authtool --gen-key --name=client.admin --set-uid=0 \
 		    --cap mon 'allow *' \
 		    --cap osd 'allow *' \
-		    --cap mds allow \
+		    --cap mds 'allow *' \
 		    $keyring_fn
 
 		# build a fresh fs monmap, mon fs
@@ -538,11 +542,11 @@ EOF
 			mon 'allow *' osd 'allow *' mds 'allow'
 	    fi
 
-        cmd="$CEPH_ADM osd pool create cephfs_data 128"
+        cmd="$CEPH_ADM osd pool create cephfs_data 8"
         echo $cmd
         $cmd
 
-        cmd="$CEPH_ADM osd pool create cephfs_metadata 128"
+        cmd="$CEPH_ADM osd pool create cephfs_metadata 8"
         echo $cmd
         $cmd
 
@@ -624,6 +628,22 @@ do_rgw()
     local skey='h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q=='
     echo "setting up user testid"
     $CEPH_BIN/radosgw-admin user create --uid testid --access-key $akey --secret $skey --display-name 'M. Tester' --email tester@ceph.com -c $conf_fn > /dev/null
+
+    # Create S3-test users
+    # See: https://github.com/ceph/s3-tests
+    echo "setting up s3-test users"
+    $CEPH_BIN/radosgw-admin user create \
+        --uid 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+        --access-key ABCDEFGHIJKLMNOPQRST \
+        --secret abcdefghijklmnopqrstuvwxyzabcdefghijklmn \
+        --display-name youruseridhere \
+        --email s3@example.com -c $conf_fn > /dev/null
+    $CEPH_BIN/radosgw-admin user create \
+        --uid 56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234 \
+        --access-key NOPQRSTUVWXYZABCDEFG \
+        --secret nopqrstuvwxyzabcdefghijklmnabcdefghijklm \
+        --display-name john.doe \
+        --email john.doe@example.com -c $conf_fn > /dev/null
 
     # Create Swift user
     echo "setting up user tester"

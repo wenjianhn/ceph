@@ -79,7 +79,7 @@ bin_PROGRAMS += ceph-syn
 
 
 libkrbd_la_SOURCES = krbd.cc
-libkrbd_la_LIBADD = $(LIBSECRET) -lblkid -ludev
+libkrbd_la_LIBADD = $(LIBSECRET) $(LIBCOMMON) -lblkid -ludev
 if LINUX
 noinst_LTLIBRARIES += libkrbd.la
 endif LINUX
@@ -644,6 +644,7 @@ TESTS = \
 	$(check_SCRIPTS)
 
 check-local:
+	$(top_srcdir)/qa/workunits/erasure-code/encode-decode-non-regression.sh 
 	$(srcdir)/test/encoding/readable.sh ../ceph-object-corpus
 
 if WITH_LTTNG
@@ -659,8 +660,9 @@ core-daemons: ceph-mon ceph-osd ceph-mds radosgw
 admin-tools: monmaptool osdmaptool crushtool ceph-authtool
 base: core-daemons admin-tools \
 	cephfs ceph-syn ceph-conf \
-	rados librados-config \
-	init-ceph ceph_mon_store_converter ceph-post-file
+	rados radosgw-admin librados-config \
+	init-ceph ceph_mon_store_converter ceph-post-file \
+	ceph
 
 
 # version stuff
@@ -714,7 +716,7 @@ ceph: ceph.in ./ceph_ver.h Makefile
 
 clean-local:
 	rm -f *.so 
-	find . -name '*.gcno' -o -name '*.gcda' -o -name '*.lcov' | xargs rm -f
+	find . -name '*.gcno' -o -name '*.gcda' -o -name '*.lcov' -o -name "*.o" -o -name "*.lo" | xargs rm -f
 	rm -f ceph java/java/com/ceph/crush/Bucket.class
 
 

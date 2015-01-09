@@ -91,6 +91,7 @@ struct PGRecoveryStats {
     utime_t total_time;       // total time in state
     utime_t min_time, max_time;
 
+    // cppcheck-suppress unreachableCode
     per_state_info() : enter(0), exit(0), events(0) {}
   };
   map<const char *,per_state_info> info;
@@ -279,13 +280,20 @@ public:
   // pg state
   pg_info_t        info;
   __u8 info_struct_v;
-  static const __u8 cur_struct_v = 7;
+  static const __u8 cur_struct_v = 8;
+  // v7 was SnapMapper addition in 86658392516d5175b2756659ef7ffaaf95b0f8ad
+  // (first appeared in cuttlefish).
+  static const __u8 compat_struct_v = 7;
   bool must_upgrade() {
-    return info_struct_v < 7;
+    return info_struct_v < cur_struct_v;
+  }
+  bool can_upgrade() {
+    return info_struct_v >= compat_struct_v;
   }
   void upgrade(
     ObjectStore *store,
     const interval_set<snapid_t> &snapcolls);
+  void _upgrade_v7(ObjectStore *store, const interval_set<snapid_t> &snapcolls);
 
   const coll_t coll;
   PGLog  pg_log;
@@ -298,8 +306,7 @@ public:
   static string get_epoch_key(spg_t pgid) {
     return stringify(pgid) + "_epoch";
   }
-  hobject_t    log_oid;
-  hobject_t    biginfo_oid;
+  ghobject_t    pgmeta_oid;
 
   class MissingLoc {
     map<hobject_t, pg_missing_t::item> needs_recovery_map;
@@ -393,7 +400,8 @@ public:
     bool add_source_info(
       pg_shard_t source,           ///< [in] source
       const pg_info_t &oinfo,      ///< [in] info
-      const pg_missing_t &omissing ///< [in] (optional) missing
+      const pg_missing_t &omissing, ///< [in] (optional) missing
+      ThreadPool::TPHandle* handle  ///< [in] ThreadPool handle
       ); ///< @return whether a new object location was discovered
 
     /// Uses osdmap to update structures for now down sources
@@ -417,7 +425,6 @@ public:
     }
   } missing_loc;
   
-  interval_set<snapid_t> snap_collections; // obsolete
   map<epoch_t,pg_interval_t> past_intervals;
 
   interval_set<snapid_t> snap_trimq;
@@ -519,6 +526,7 @@ public:
     C_Contexts *on_applied;
     C_Contexts *on_safe;
     ObjectStore::Transaction *transaction;
+    ThreadPool::TPHandle* handle;
     RecoveryCtx(map<int, map<spg_t, pg_query_t> > *query_map,
 		map<int,
 		    vector<pair<pg_notify_t, pg_interval_map_t> > > *info_map,
@@ -531,7 +539,8 @@ public:
 	notify_list(notify_list),
 	on_applied(on_applied),
 	on_safe(on_safe),
-	transaction(transaction) {}
+	transaction(transaction),
+        handle(NULL) {}
 
     RecoveryCtx(BufferedRecoveryMessages &buf, RecoveryCtx &rctx)
       : query_map(&(buf.query_map)),
@@ -539,7 +548,8 @@ public:
 	notify_list(&(buf.notify_list)),
 	on_applied(rctx.on_applied),
 	on_safe(rctx.on_safe),
-	transaction(rctx.transaction) {}
+	transaction(rctx.transaction),
+        handle(NULL) {}
 
     void accept_buffered_messages(BufferedRecoveryMessages &m) {
       assert(query_map);
@@ -1197,6 +1207,7 @@ public:
     spg_t child,
     int split_bits,
     int seed,
+    const pg_pool_t *pool,
     ObjectStore::Transaction *t) = 0;
   virtual bool _report_snap_collection_errors(
     const hobject_t &hoid,
@@ -1302,10 +1313,12 @@ public:
   struct MNotifyRec : boost::statechart::event< MNotifyRec > {
     pg_shard_t from;
     pg_notify_t notify;
-    MNotifyRec(pg_shard_t from, pg_notify_t &notify) :
-      from(from), notify(notify) {}
+    uint64_t features;
+    MNotifyRec(pg_shard_t from, pg_notify_t &notify, uint64_t f) :
+      from(from), notify(notify), features(f) {}
     void print(std::ostream *out) const {
-      *out << "MNotifyRec from " << from << " notify: " << notify;
+      *out << "MNotifyRec from " << from << " notify: " << notify
+        << " features: 0x" << hex << features << dec;
     }
   };
 
@@ -1980,7 +1993,7 @@ public:
 
  public:
   PG(OSDService *o, OSDMapRef curmap,
-     const PGPool &pool, spg_t p, const hobject_t& loid, const hobject_t& ioid);
+     const PGPool &pool, spg_t p);
   virtual ~PG();
 
  private:
@@ -1988,10 +2001,15 @@ public:
   PG(const PG& rhs);
   PG& operator=(const PG& rhs);
   const spg_t pg_id;
+  uint64_t peer_features;
 
  public:
   const spg_t&      get_pgid() const { return pg_id; }
   int        get_nrep() const { return acting.size(); }
+
+  void reset_peer_features() { peer_features = (uint64_t)-1; }
+  uint64_t get_min_peer_features() { return peer_features; }
+  void apply_peer_features(uint64_t f) { peer_features &= f; }
 
   void init_primary_up_acting(
     const vector<int> &newup,
@@ -2075,6 +2093,10 @@ public:
   // pg on-disk state
   void do_pending_flush();
 
+  static void _create(ObjectStore::Transaction& t, spg_t pgid);
+  static void _init(ObjectStore::Transaction& t,
+		    spg_t pgid, const pg_pool_t *pool);
+
 private:
   void write_info(ObjectStore::Transaction& t);
 
@@ -2082,9 +2104,8 @@ public:
   static int _write_info(ObjectStore::Transaction& t, epoch_t epoch,
     pg_info_t &info, coll_t coll,
     map<epoch_t,pg_interval_t> &past_intervals,
-    interval_set<snapid_t> &snap_collections,
-    hobject_t &infos_oid,
-    __u8 info_struct_v, bool dirty_big_info, bool force_ver = false);
+    ghobject_t &pgmeta_oid,
+    bool dirty_big_info);
   void write_if_dirty(ObjectStore::Transaction& t);
 
   eversion_t get_next_version() const {
@@ -2107,13 +2128,12 @@ public:
 
   std::string get_corrupt_pg_log_name() const;
   static int read_info(
-    ObjectStore *store, const coll_t &coll,
+    ObjectStore *store, spg_t pgid, const coll_t &coll,
     bufferlist &bl, pg_info_t &info, map<epoch_t,pg_interval_t> &past_intervals,
-    hobject_t &biginfo_oid, hobject_t &infos_oid,
-    interval_set<snapid_t>  &snap_collections, __u8 &);
+    __u8 &);
   void read_state(ObjectStore *store, bufferlist &bl);
-  static epoch_t peek_map_epoch(ObjectStore *store, coll_t coll,
-                               hobject_t &infos_oid, bufferlist *bl);
+  static bool _has_removal_flag(ObjectStore *store, spg_t pgid);
+  static epoch_t peek_map_epoch(ObjectStore *store, spg_t pgid, bufferlist *bl);
   void update_snap_map(
     vector<pg_log_entry_t> &log_entries,
     ObjectStore::Transaction& t);
@@ -2187,12 +2207,6 @@ public:
   void take_waiters();
   void queue_peering_event(CephPeeringEvtRef evt);
   void handle_peering_event(CephPeeringEvtRef evt, RecoveryCtx *rctx);
-  void queue_notify(epoch_t msg_epoch, epoch_t query_epoch,
-		    pg_shard_t from, pg_notify_t& i);
-  void queue_info(epoch_t msg_epoch, epoch_t query_epoch,
-		  pg_shard_t from, pg_info_t& i);
-  void queue_log(epoch_t msg_epoch, epoch_t query_epoch, pg_shard_t from,
-		 MOSDPGLog *msg);
   void queue_query(epoch_t msg_epoch, epoch_t query_epoch,
 		   pg_shard_t from, const pg_query_t& q);
   void queue_null(epoch_t msg_epoch, epoch_t query_epoch);

@@ -396,8 +396,19 @@ void OSDMap::Incremental::encode(bufferlist& bl, uint64_t features) const
     return;
   }
 
+  // only a select set of callers should *ever* be encoding new
+  // OSDMaps.  others should be passing around the canonical encoded
+  // buffers from on high.  select out those callers by passing in an
+  // "impossible" feature bit.
+  assert(features & CEPH_FEATURE_RESERVED);
+  features &= ~CEPH_FEATURE_RESERVED;
+
+  size_t start_offset = bl.length();
+  size_t tail_offset;
+  buffer::list::iterator crc_it;
+
   // meta-encoding: how we include client-used and osd-specific data
-  ENCODE_START(7, 7, bl);
+  ENCODE_START(8, 7, bl);
 
   {
     ENCODE_START(3, 1, bl); // client-usable data
@@ -441,8 +452,26 @@ void OSDMap::Incremental::encode(bufferlist& bl, uint64_t features) const
     ENCODE_FINISH(bl); // osd-only data
   }
 
+  ::encode((uint32_t)0, bl); // dummy inc_crc
+  crc_it = bl.end();
+  crc_it.advance(-4);
+  tail_offset = bl.length();
+
+  ::encode(full_crc, bl);
+
   ENCODE_FINISH(bl); // meta-encoding wrapper
 
+  // fill in crc
+  bufferlist front;
+  front.substr_of(bl, start_offset, crc_it.get_off() - start_offset);
+  inc_crc = front.crc32c(-1);
+  bufferlist tail;
+  tail.substr_of(bl, tail_offset, bl.length() - tail_offset);
+  inc_crc = tail.crc32c(inc_crc);
+  ceph_le32 crc_le;
+  crc_le = inc_crc;
+  crc_it.copy_in(4, (char*)&crc_le);
+  have_crc = true;
 }
 
 void OSDMap::Incremental::decode_classic(bufferlist::iterator &p)
@@ -547,7 +576,11 @@ void OSDMap::Incremental::decode(bufferlist::iterator& bl)
    * a struct_v < 7, we must rewind to the beginning and use our
    * classic decoder.
    */
-  DECODE_START_LEGACY_COMPAT_LEN(7, 7, 7, bl); // wrapper
+  size_t start_offset = bl.get_off();
+  size_t tail_offset = 0;
+  bufferlist crc_front, crc_tail;
+
+  DECODE_START_LEGACY_COMPAT_LEN(8, 7, 7, bl); // wrapper
   if (struct_v < 7) {
     int struct_v_size = sizeof(struct_v);
     bl.advance(-struct_v_size);
@@ -608,7 +641,35 @@ void OSDMap::Incremental::decode(bufferlist::iterator& bl)
     DECODE_FINISH(bl); // osd-only data
   }
 
+  if (struct_v >= 8) {
+    have_crc = true;
+    crc_front.substr_of(bl.get_bl(), start_offset, bl.get_off() - start_offset);
+    ::decode(inc_crc, bl);
+    tail_offset = bl.get_off();
+    ::decode(full_crc, bl);
+  } else {
+    have_crc = false;
+    full_crc = 0;
+    inc_crc = 0;
+  }
+
   DECODE_FINISH(bl); // wrapper
+
+  if (have_crc) {
+    // verify crc
+    uint32_t actual = crc_front.crc32c(-1);
+    if (tail_offset < bl.get_off()) {
+      bufferlist tail;
+      tail.substr_of(bl.get_bl(), tail_offset, bl.get_off() - tail_offset);
+      actual = tail.crc32c(actual);
+    }
+    if (inc_crc != actual) {
+      ostringstream ss;
+      ss << "bad crc, actual " << actual << " != expected " << inc_crc;
+      string s = ss.str();
+      throw buffer::malformed_input(s.c_str());
+    }
+  }
 }
 
 void OSDMap::Incremental::dump(Formatter *f) const
@@ -991,6 +1052,17 @@ uint64_t OSDMap::get_features(int entity_type, uint64_t *pmask) const
 	features |= CEPH_FEATURE_CRUSH_V2;
       if (crush->is_v3_rule(ruleid))
 	features |= CEPH_FEATURE_CRUSH_TUNABLES3;
+    }
+  }
+  if (entity_type == CEPH_ENTITY_TYPE_OSD) {
+    for (map<string,map<string,string> >::const_iterator p = erasure_code_profiles.begin();
+	 p != erasure_code_profiles.end();
+	 ++p) {
+      const map<string,string> &profile = p->second;
+      map<string,string>::const_iterator plugin = profile.find("plugin");
+      if (plugin != profile.end() && (plugin->second == "isa" ||
+				      plugin->second == "lrc"))
+	features |= CEPH_FEATURE_ERASURE_CODE_PLUGINS_V2;
     }
   }
   mask |= CEPH_FEATURE_OSDHASHPSPOOL | CEPH_FEATURE_OSD_CACHEPOOL;
@@ -1775,8 +1847,20 @@ void OSDMap::encode(bufferlist& bl, uint64_t features) const
     encode_classic(bl, features);
     return;
   }
+
+  // only a select set of callers should *ever* be encoding new
+  // OSDMaps.  others should be passing around the canonical encoded
+  // buffers from on high.  select out those callers by passing in an
+  // "impossible" feature bit.
+  assert(features & CEPH_FEATURE_RESERVED);
+  features &= ~CEPH_FEATURE_RESERVED;
+
+  size_t start_offset = bl.length();
+  size_t tail_offset;
+  buffer::list::iterator crc_it;
+
   // meta-encoding: how we include client-used and osd-specific data
-  ENCODE_START(7, 7, bl);
+  ENCODE_START(8, 7, bl);
 
   {
     ENCODE_START(3, 1, bl); // client-usable data
@@ -1836,7 +1920,26 @@ void OSDMap::encode(bufferlist& bl, uint64_t features) const
     ENCODE_FINISH(bl); // osd-only data
   }
 
+  ::encode((uint32_t)0, bl); // dummy crc
+  crc_it = bl.end();
+  crc_it.advance(-4);
+  tail_offset = bl.length();
+
   ENCODE_FINISH(bl); // meta-encoding wrapper
+
+  // fill in crc
+  bufferlist front;
+  front.substr_of(bl, start_offset, crc_it.get_off() - start_offset);
+  crc = front.crc32c(-1);
+  if (tail_offset < bl.length()) {
+    bufferlist tail;
+    tail.substr_of(bl, tail_offset, bl.length() - tail_offset);
+    crc = tail.crc32c(crc);
+  }
+  ceph_le32 crc_le;
+  crc_le = crc;
+  crc_it.copy_in(4, (char*)&crc_le);
+  crc_defined = true;
 }
 
 void OSDMap::decode(bufferlist& bl)
@@ -1965,7 +2068,11 @@ void OSDMap::decode(bufferlist::iterator& bl)
    * a struct_v < 7, we must rewind to the beginning and use our
    * classic decoder.
    */
-  DECODE_START_LEGACY_COMPAT_LEN(7, 7, 7, bl); // wrapper
+  size_t start_offset = bl.get_off();
+  size_t tail_offset = 0;
+  bufferlist crc_front, crc_tail;
+
+  DECODE_START_LEGACY_COMPAT_LEN(8, 7, 7, bl); // wrapper
   if (struct_v < 7) {
     int struct_v_size = sizeof(struct_v);
     bl.advance(-struct_v_size);
@@ -2032,7 +2139,33 @@ void OSDMap::decode(bufferlist::iterator& bl)
     DECODE_FINISH(bl); // osd-only data
   }
 
+  if (struct_v >= 8) {
+    crc_front.substr_of(bl.get_bl(), start_offset, bl.get_off() - start_offset);
+    ::decode(crc, bl);
+    tail_offset = bl.get_off();
+    crc_defined = true;
+  } else {
+    crc_defined = false;
+    crc = 0;
+  }
+
   DECODE_FINISH(bl); // wrapper
+
+  if (tail_offset) {
+    // verify crc
+    uint32_t actual = crc_front.crc32c(-1);
+    if (tail_offset < bl.get_off()) {
+      bufferlist tail;
+      tail.substr_of(bl.get_bl(), tail_offset, bl.get_off() - tail_offset);
+      actual = tail.crc32c(actual);
+    }
+    if (crc != actual) {
+      ostringstream ss;
+      ss << "bad crc, actual " << actual << " != expected " << crc;
+      string s = ss.str();
+      throw buffer::malformed_input(s.c_str());
+    }
+  }
 
   post_decode();
 }
@@ -2237,18 +2370,8 @@ struct qi {
   qi(int i, int d, float w) : item(i), depth(d), weight(w) {}
 };
 
-void OSDMap::print(ostream& out) const
+void OSDMap::print_pools(ostream& out) const
 {
-  out << "epoch " << get_epoch() << "\n"
-      << "fsid " << get_fsid() << "\n"
-      << "created " << get_created() << "\n"
-      << "modified " << get_modified() << "\n";
-
-  out << "flags " << get_flag_string() << "\n";
-  if (get_cluster_snapshot().length())
-    out << "cluster_snapshot " << get_cluster_snapshot() << "\n";
-  out << "\n";
-
   for (map<int64_t,pg_pool_t>::const_iterator p = pools.begin(); p != pools.end(); ++p) {
     std::string name("<unknown>");
     map<int64_t,string>::const_iterator pni = pool_name.find(p->first);
@@ -2265,6 +2388,21 @@ void OSDMap::print(ostream& out) const
       out << "\tremoved_snaps " << p->second.removed_snaps << "\n";
   }
   out << std::endl;
+}
+
+void OSDMap::print(ostream& out) const
+{
+  out << "epoch " << get_epoch() << "\n"
+      << "fsid " << get_fsid() << "\n"
+      << "created " << get_created() << "\n"
+      << "modified " << get_modified() << "\n";
+
+  out << "flags " << get_flag_string() << "\n";
+  if (get_cluster_snapshot().length())
+    out << "cluster_snapshot " << get_cluster_snapshot() << "\n";
+  out << "\n";
+
+  print_pools(out);
 
   out << "max_osd " << get_max_osd() << "\n";
   for (int i=0; i<get_max_osd(); i++) {
@@ -2430,17 +2568,17 @@ void OSDMap::print_tree(ostream *out, Formatter *f) const
   if (!stray.empty()) {
     if (out)
       *out << "\n";
-    if (f)
-      f->open_object_section("osd");
     for (set<int>::iterator p = stray.begin(); p != stray.end(); ++p) {
       if (out)
 	*out << *p << "\t0\t";
+      if (f)
+        f->open_object_section("osd");
       print_osd_line(*p, out, f);
       if (out)
 	*out << "\n";
+      if (f)
+        f->close_section();
     }
-    if (f)
-      f->close_section();
   }
   if (f)
     f->close_section();

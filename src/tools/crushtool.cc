@@ -114,10 +114,13 @@ void usage()
   cout << "                         reweight a given item (and adjust ancestor\n"
        << "                         weights as needed)\n";
   cout << "   -i mapfn --reweight   recalculate all bucket weights\n";
+  cout << "   -i mapfn --show-location id\n";
+  cout << "                         show location for given device id\n";
   cout << "   --show-utilization    show OSD usage\n";
   cout << "   --show utilization-all\n";
   cout << "                         include zero weight items\n";
   cout << "   --show-statistics     show chi squared statistics\n";
+  cout << "   --show-mappings       show mappings\n";
   cout << "   --show-bad-mappings   show bad mappings\n";
   cout << "   --show-choose-tries   show choose tries histogram\n";
   cout << "   --set-choose-local-tries N\n";
@@ -168,6 +171,7 @@ int main(int argc, const char **argv)
   bool decompile = false;
   bool test = false;
   bool display = false;
+  int full_location = -1;
   bool write_to_file = false;
   int verbose = 0;
   bool unsafe_tunables = false;
@@ -190,6 +194,7 @@ int main(int argc, const char **argv)
   int choose_total_tries = -1;
   int chooseleaf_descend_once = -1;
   int chooseleaf_vary_r = -1;
+  int straw_calc_version = -1;
 
   CrushWrapper crush;
 
@@ -233,6 +238,9 @@ int main(int argc, const char **argv)
     } else if (ceph_argparse_flag(args, i, "--show_statistics", (char*)NULL)) {
       display = true;
       tester.set_output_statistics(true);
+    } else if (ceph_argparse_flag(args, i, "--show_mappings", (char*)NULL)) {
+      display = true;
+      tester.set_output_mappings(true);
     } else if (ceph_argparse_flag(args, i, "--show_bad_mappings", (char*)NULL)) {
       display = true;
       tester.set_output_bad_mappings(true);
@@ -244,6 +252,7 @@ int main(int argc, const char **argv)
       compile = true;
     } else if (ceph_argparse_flag(args, i, "-t", "--test", (char*)NULL)) {
       test = true;
+    } else if (ceph_argparse_withint(args, i, &full_location, &err, "--show-location", (char*)NULL)) {
     } else if (ceph_argparse_flag(args, i, "-s", "--simulate", (char*)NULL)) {
       tester.set_random_placement();
     } else if (ceph_argparse_flag(args, i, "--enable-unsafe-tunables", (char*)NULL)) {
@@ -262,6 +271,9 @@ int main(int argc, const char **argv)
       adjust = true;
     } else if (ceph_argparse_withint(args, i, &chooseleaf_vary_r, &err,
 				     "--set_chooseleaf_vary_r", (char*)NULL)) {
+      adjust = true;
+    } else if (ceph_argparse_withint(args, i, &straw_calc_version, &err,
+				     "--set_straw_calc_version", (char*)NULL)) {
       adjust = true;
     } else if (ceph_argparse_flag(args, i, "--reweight", (char*)NULL)) {
       reweight = true;
@@ -431,7 +443,7 @@ int main(int argc, const char **argv)
     exit(EXIT_FAILURE);
   }
   if (!compile && !decompile && !build && !test && !reweight && !adjust &&
-      add_item < 0 &&
+      add_item < 0 && full_location < 0 &&
       remove_name.empty() && reweight_name.empty()) {
     cerr << "no action specified; -h for help" << std::endl;
     exit(EXIT_FAILURE);
@@ -477,6 +489,15 @@ int main(int argc, const char **argv)
     crush.decode(p);
   }
 
+  if (full_location >= 0) {
+    map<string, string> loc = crush.get_full_location(full_location);
+    for (map<string,string>::iterator p = loc.begin();
+	 p != loc.end();
+	 ++p) {
+      cout << p->first << "\t" << p->second << std::endl;
+    }
+    exit(0);
+  }
   if (decompile) {
     CrushCompiler cc(crush, cerr, verbose);
     if (!outfn.empty()) {
@@ -708,6 +729,10 @@ int main(int argc, const char **argv)
   }
   if (chooseleaf_vary_r >= 0) {
     crush.set_chooseleaf_vary_r(chooseleaf_vary_r);
+    modified = true;
+  }
+  if (straw_calc_version >= 0) {
+    crush.set_straw_calc_version(straw_calc_version);
     modified = true;
   }
   if (modified) {

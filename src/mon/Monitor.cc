@@ -279,11 +279,15 @@ void Monitor::do_admin_command(string command, cmdmap_t& cmdmap, string format,
     args += cmd_vartype_stringify(p->second);
   }
   args = "[" + args + "]";
+ 
+  bool read_only = false;
+  if (command == "mon_status" || command == "quorum_status") {
+    read_only = true;
+  }
 
-  audit_clog->info() << "from='admin socket' "
-                    << "entity='admin socket' "
-                    << "cmd=" << command << " "
-                    << "args=" << args << ": dispatch";
+  (read_only ? audit_clog->debug() : audit_clog->info())
+    << "from='admin socket' entity='admin socket' "
+    << "cmd='" << command << "' args=" << args << ": dispatch";
 
   if (command == "mon_status") {
     get_mon_status(f.get(), ss);
@@ -304,9 +308,6 @@ void Monitor::do_admin_command(string command, cmdmap_t& cmdmap, string format,
   } else if (command.find("add_bootstrap_peer_hint") == 0) {
     if (!_add_bootstrap_peer_hint(command, cmdmap, ss))
       goto abort;
-  } else if (command.find("osdmonitor_prepare_command") == 0) {
-    if (!_osdmonitor_prepare_command(cmdmap, ss))
-      goto abort;
   } else if (command == "quorum enter") {
     elector.start_participating();
     start_election();
@@ -318,17 +319,19 @@ void Monitor::do_admin_command(string command, cmdmap_t& cmdmap, string format,
   } else {
     assert(0 == "bad AdminSocket command binding");
   }
-  audit_clog->info() << "from='admin socket' "
-                    << "entity='admin socket' "
-                    << "cmd=" << command << " "
-                    << "args=" << args << ": finished";
+  (read_only ? audit_clog->debug() : audit_clog->info())
+    << "from='admin socket' "
+    << "entity='admin socket' "
+    << "cmd=" << command << " "
+    << "args=" << args << ": finished";
   return;
 
 abort:
-  audit_clog->info() << "from='admin socket' "
-                    << "entity='admin socket' "
-                    << "cmd=" << command << " "
-                    << "args=" << args << ": aborted";
+  (read_only ? audit_clog->debug() : audit_clog->info())
+    << "from='admin socket' "
+    << "entity='admin socket' "
+    << "cmd=" << command << " "
+    << "args=" << args << ": aborted";
 }
 
 void Monitor::handle_signal(int signum)
@@ -347,6 +350,7 @@ CompatSet Monitor::get_supported_features()
   ceph_mon_feature_incompat.insert(CEPH_MON_FEATURE_INCOMPAT_SINGLE_PAXOS);
   ceph_mon_feature_incompat.insert(CEPH_MON_FEATURE_INCOMPAT_OSD_ERASURE_CODES);
   ceph_mon_feature_incompat.insert(CEPH_MON_FEATURE_INCOMPAT_OSDMAP_ENC);
+  ceph_mon_feature_incompat.insert(CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V2);
   return CompatSet(ceph_mon_feature_compat, ceph_mon_feature_ro_compat,
 		   ceph_mon_feature_incompat);
 }
@@ -447,76 +451,21 @@ void Monitor::handle_conf_change(const struct md_config_t *conf,
   }
 }
 
-void Monitor::update_log_client(
-    LogChannelRef lc, const string &name,
-    map<string,string> &log_to_monitors,
-    map<string,string> &log_to_syslog,
-    map<string,string> &log_channels,
-    map<string,string> &log_prios)
-{
-  bool to_monitors = (get_str_map_key(log_to_monitors, name,
-                                      &CLOG_CHANNEL_DEFAULT) == "true");
-  bool to_syslog = (get_str_map_key(log_to_syslog, name,
-                                    &CLOG_CHANNEL_DEFAULT) == "true");
-  string syslog_facility = get_str_map_key(log_channels, name,
-                                           &CLOG_CHANNEL_DEFAULT);
-  string prio = get_str_map_key(log_prios, name, &CLOG_CHANNEL_DEFAULT);
-
-  lc->set_log_to_monitors(to_monitors);
-  lc->set_log_to_syslog(to_syslog);
-  lc->set_syslog_facility(syslog_facility);
-  lc->set_log_channel(name);
-  lc->set_log_prio(prio);
-
-  dout(15) << __func__ << " " << name << "("
-           << " to_monitors: " << (to_monitors ? "true" : "false")
-           << " to_syslog: " << (to_syslog ? "true" : "false")
-           << " syslog_facility: " << syslog_facility
-           << " prio: " << prio << ")" << dendl;
-}
-
 void Monitor::update_log_clients()
 {
   map<string,string> log_to_monitors;
   map<string,string> log_to_syslog;
   map<string,string> log_channel;
   map<string,string> log_prio;
-  ostringstream oss;
 
-  int r = get_conf_str_map_helper(g_conf->clog_to_monitors, oss,
-                                  &log_to_monitors, CLOG_CHANNEL_DEFAULT);
-  if (r < 0) {
-    derr << __func__ << " error parsing 'clog_to_monitors'" << dendl;
+  if (parse_log_client_options(g_ceph_context, log_to_monitors, log_to_syslog,
+			       log_channel, log_prio))
     return;
-  }
 
-  r = get_conf_str_map_helper(g_conf->clog_to_syslog, oss,
-                              &log_to_syslog, CLOG_CHANNEL_DEFAULT);
-  if (r < 0) {
-    derr << __func__ << " error parsing 'clog_to_syslog'" << dendl;
-    return;
-  }
-
-  r = get_conf_str_map_helper(g_conf->clog_to_syslog_facility, oss,
-                              &log_channel, CLOG_CHANNEL_DEFAULT);
-  if (r < 0) {
-    derr << __func__ << " error parsing 'clog_to_syslog_facility'" << dendl;
-    return;
-  }
-
-  r = get_conf_str_map_helper(g_conf->clog_to_syslog_level, oss,
-                              &log_prio, CLOG_CHANNEL_DEFAULT);
-  if (r < 0) {
-    derr << __func__ << " error parsing 'clog_to_syslog_level'" << dendl;
-    return;
-  }
-
-  update_log_client(clog, CLOG_CHANNEL_CLUSTER,
-                    log_to_monitors, log_to_syslog,
-                    log_channel, log_prio);
-  update_log_client(audit_clog, CLOG_CHANNEL_AUDIT,
-                    log_to_monitors, log_to_syslog,
-                    log_channel, log_prio);
+  clog->update_config(log_to_monitors, log_to_syslog,
+		      log_channel, log_prio);
+  audit_clog->update_config(log_to_monitors, log_to_syslog,
+			    log_channel, log_prio);
 }
 
 int Monitor::sanitize_options()
@@ -719,11 +668,6 @@ int Monitor::preinit()
   r = admin_socket->register_command("mon_status", "mon_status", admin_hook,
 				     "show current monitor status");
   assert(r == 0);
-  if (g_conf->mon_advanced_debug_mode) {
-    r = admin_socket->register_command("osdmonitor_prepare_command", "osdmonitor_prepare_command", admin_hook,
-				       "call OSDMonitor::prepare_command");
-    assert(r == 0);
-  }
   r = admin_socket->register_command("quorum_status", "quorum_status",
 				     admin_hook, "show current quorum status");
   assert(r == 0);
@@ -856,16 +800,9 @@ void Monitor::shutdown()
   dout(1) << "shutdown" << dendl;
 
   lock.Lock();
+  wait_for_paxos_write();
 
   state = STATE_SHUTDOWN;
-
-  if (paxos->is_writing() || paxos->is_writing_previous()) {
-    dout(10) << __func__ << " flushing" << dendl;
-    lock.Unlock();
-    store->flush();
-    lock.Lock();
-    dout(10) << __func__ << " flushed" << dendl;
-  }
 
   if (admin_hook) {
     AdminSocket* admin_socket = cct->get_admin_socket();
@@ -912,15 +849,21 @@ void Monitor::shutdown()
   messenger->shutdown();  // last thing!  ceph_mon.cc will delete mon.
 }
 
-void Monitor::bootstrap()
+void Monitor::wait_for_paxos_write()
 {
   if (paxos->is_writing() || paxos->is_writing_previous()) {
-    dout(10) << "bootstrap flushing pending write" << dendl;
+    dout(10) << __func__ << " flushing pending write" << dendl;
     lock.Unlock();
     store->flush();
     lock.Lock();
+    dout(10) << __func__ << " flushed pending write" << dendl;
   }
+}
+
+void Monitor::bootstrap()
+{
   dout(10) << "bootstrap" << dendl;
+  wait_for_paxos_write();
 
   sync_reset_requester();
   unregister_cluster_logger();
@@ -985,30 +928,6 @@ void Monitor::bootstrap()
       messenger->send_message(new MMonProbe(monmap->fsid, MMonProbe::OP_PROBE, name, has_ever_joined), i);
     }
   }
-}
-
-bool Monitor::_osdmonitor_prepare_command(cmdmap_t& cmdmap, ostream& ss)
-{
-  if (!is_leader()) {
-    ss << "mon must be a leader";
-    return false;
-  }
-
-  string cmd;
-  cmd_getval(g_ceph_context, cmdmap, "prepare", cmd);
-  cmdmap["prefix"] = cmdmap["prepare"];
-
-  OSDMonitor *monitor = osdmon();
-  MMonCommand *m = static_cast<MMonCommand *>((new MMonCommand())->get());
-  bool r = true;
-  if (monitor->prepare_command_impl(m, cmdmap)) {
-    ss << "true";
-  } else {
-    ss << "false";
-    r = false;
-  }
-  m->put();
-  return r;
 }
 
 bool Monitor::_add_bootstrap_peer_hint(string cmd, cmdmap_t& cmdmap, ostream& ss)
@@ -1609,6 +1528,8 @@ void Monitor::handle_probe(MMonProbe *m)
  */
 void Monitor::handle_probe_probe(MMonProbe *m)
 {
+  MMonProbe *r;
+
   dout(10) << "handle_probe_probe " << m->get_source_inst() << *m
 	   << " features " << m->get_connection()->get_features() << dendl;
   uint64_t missing = required_features & ~m->get_connection()->get_features();
@@ -1621,12 +1542,26 @@ void Monitor::handle_probe_probe(MMonProbe *m)
       m->required_features = required_features;
       m->get_connection()->send_message(r);
     }
-    m->put();
-    return;
+    goto out;
   }
 
-  MMonProbe *r = new MMonProbe(monmap->fsid, MMonProbe::OP_REPLY,
-			       name, has_ever_joined);
+  if (!is_probing() && !is_synchronizing()) {
+    // If the probing mon is way ahead of us, we need to re-bootstrap.
+    // Normally we capture this case when we initially bootstrap, but
+    // it is possible we pass those checks (we overlap with
+    // quorum-to-be) but fail to join a quorum before it moves past
+    // us.  We need to be kicked back to bootstrap so we can
+    // synchonize, not keep calling elections.
+    if (paxos->get_version() + 1 < m->paxos_first_version) {
+      dout(1) << " peer " << m->get_source_addr() << " has first_committed "
+	      << "ahead of us, re-bootstrapping" << dendl;
+      bootstrap();
+      goto out;
+
+    }
+  }
+
+  r = new MMonProbe(monmap->fsid, MMonProbe::OP_REPLY, name, has_ever_joined);
   r->name = name;
   r->quorum = quorum;
   monmap->encode(r->monmap_bl, m->get_connection()->get_features());
@@ -1641,6 +1576,7 @@ void Monitor::handle_probe_probe(MMonProbe *m)
     extra_probe_peers.insert(m->get_source_addr());
   }
 
+ out:
   m->put();
 }
 
@@ -1799,6 +1735,7 @@ void Monitor::handle_probe_reply(MMonProbe *m)
 void Monitor::join_election()
 {
   dout(10) << __func__ << dendl;
+  wait_for_paxos_write();
   _reset();
   state = STATE_ELECTING;
 
@@ -1808,6 +1745,7 @@ void Monitor::join_election()
 void Monitor::start_election()
 {
   dout(10) << "start_election" << dendl;
+  wait_for_paxos_write();
   _reset();
   state = STATE_ELECTING;
 
@@ -1943,7 +1881,9 @@ void Monitor::apply_quorum_to_compatset_features()
   if (quorum_features & CEPH_FEATURE_OSDMAP_ENC) {
     new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_OSDMAP_ENC);
   }
-
+  if (quorum_features & CEPH_FEATURE_ERASURE_CODE_PLUGINS_V2) {
+    new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V2);
+  }
   if (new_features.compare(features) != 0) {
     CompatSet diff = features.unsupported(new_features);
     dout(1) << __func__ << " enabling new quorum features: " << diff << dendl;
@@ -1965,6 +1905,9 @@ void Monitor::apply_compatset_features_to_quorum_requirements()
   }
   if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_OSDMAP_ENC)) {
     required_features |= CEPH_FEATURE_OSDMAP_ENC;
+  }
+  if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V2)) {
+    required_features |= CEPH_FEATURE_ERASURE_CODE_PLUGINS_V2;
   }
   dout(10) << __func__ << " required_features " << required_features << dendl;
 }
@@ -2101,7 +2044,8 @@ void Monitor::get_mon_status(Formatter *f, ostream& ss)
   }
 }
 
-void Monitor::get_health(string& status, bufferlist *detailbl, Formatter *f)
+void Monitor::get_health(list<string>& status, bufferlist *detailbl,
+			 Formatter *f)
 {
   list<pair<health_status_t,string> > summary;
   list<pair<health_status_t,string> > detail;
@@ -2120,14 +2064,12 @@ void Monitor::get_health(string& status, bufferlist *detailbl, Formatter *f)
 
   if (f)
     f->open_array_section("summary");
-  stringstream ss;
   health_status_t overall = HEALTH_OK;
   if (!summary.empty()) {
-    ss << ' ';
     while (!summary.empty()) {
       if (overall > summary.front().first)
 	overall = summary.front().first;
-      ss << summary.front().second;
+      status.push_back(summary.front().second);
       if (f) {
         f->open_object_section("item");
         f->dump_stream("severity") <<  summary.front().first;
@@ -2135,8 +2077,6 @@ void Monitor::get_health(string& status, bufferlist *detailbl, Formatter *f)
         f->close_section();
       }
       summary.pop_front();
-      if (!summary.empty())
-	ss << "; ";
     }
   }
   if (f)
@@ -2187,15 +2127,15 @@ void Monitor::get_health(string& status, bufferlist *detailbl, Formatter *f)
       }
     }
     if (!warns.empty()) {
-      if (!ss.str().empty())
-        ss << ";";
-      ss << " clock skew detected on";
+      ostringstream ss;
+      ss << "clock skew detected on";
       while (!warns.empty()) {
         ss << " mon." << warns.front();
         warns.pop_front();
         if (!warns.empty())
           ss << ",";
       }
+      status.push_back(ss.str());
     }
     if (f)
       f->close_section();
@@ -2205,7 +2145,7 @@ void Monitor::get_health(string& status, bufferlist *detailbl, Formatter *f)
 
   stringstream fss;
   fss << overall;
-  status = fss.str() + ss.str();
+  status.push_front(fss.str());
   if (f)
     f->dump_stream("overall_status") << overall;
 
@@ -2233,7 +2173,7 @@ void Monitor::get_cluster_status(stringstream &ss, Formatter *f)
     f->open_object_section("status");
 
   // reply with the status for all the components
-  string health;
+  list<string> health;
   get_health(health, NULL, f);
 
   if (f) {
@@ -2264,8 +2204,10 @@ void Monitor::get_cluster_status(stringstream &ss, Formatter *f)
     f->close_section();
   } else {
     ss << "    cluster " << monmap->get_fsid() << "\n";
-    ss << "     health " << health << "\n";
-    ss << "     monmap " << *monmap << ", election epoch " << get_epoch()
+    ss << "     health " << joinify(health.begin(), health.end(), 
+				    string("\n            ")) << "\n";
+    ss << "     monmap " << *monmap << "\n";
+    ss << "            election epoch " << get_epoch()
        << ", quorum " << get_quorum() << " " << get_quorum_names() << "\n";
     if (mdsmon()->mdsmap.get_enabled())
       ss << "     mdsmap " << mdsmon()->mdsmap << "\n";
@@ -2315,9 +2257,9 @@ bool Monitor::_allowed_command(MonSession *s, string &module, string &prefix,
                                const map<string,string>& param_str_map,
                                const MonCommand *this_cmd) {
 
-  bool cmd_r = (this_cmd->req_perms.find('r') != string::npos);
-  bool cmd_w = (this_cmd->req_perms.find('w') != string::npos);
-  bool cmd_x = (this_cmd->req_perms.find('x') != string::npos);
+  bool cmd_r = this_cmd->requires_perm('r');
+  bool cmd_w = this_cmd->requires_perm('w');
+  bool cmd_x = this_cmd->requires_perm('x');
 
   bool capable = s->caps.is_capable(g_ceph_context, s->inst.name,
                                     module, prefix, param_str_map,
@@ -2469,25 +2411,35 @@ void Monitor::handle_command(MMonCommand *m)
     forward_request_leader(m);
     return;
   }
+  
+  /* what we perceive as being the service the command falls under */
+  string service(mon_cmd->module);
+
+  dout(25) << __func__ << " prefix='" << prefix
+           << "' module='" << module
+           << "' service='" << service << "'" << dendl;
+
+  bool cmd_is_rw =
+    (mon_cmd->requires_perm('w') || mon_cmd->requires_perm('x'));
+
   // validate user's permissions for requested command
   map<string,string> param_str_map;
   _generate_command_map(cmdmap, param_str_map);
-  if (!_allowed_command(session, module, prefix, cmdmap,
+  if (!_allowed_command(session, service, prefix, cmdmap,
                         param_str_map, mon_cmd)) {
     dout(1) << __func__ << " access denied" << dendl;
-    audit_clog->info() << "from='" << session->inst << "' "
-                      << "entity='" << session->auth_handler->get_entity_name()
-                      << "' cmd=" << m->cmd << ":  access denied";
+    (cmd_is_rw ? audit_clog->info() : audit_clog->debug())
+      << "from='" << session->inst << "' "
+      << "entity='" << session->entity_name << "' "
+      << "cmd=" << m->cmd << ":  access denied";
     reply_command(m, -EACCES, "access denied", 0);
     return;
   }
 
-  audit_clog->info() << "from='" << session->inst << "' "
-    << "entity='"
-    << (session->auth_handler ?
-        stringify(session->auth_handler->get_entity_name())
-        : "forwarded-request")
-    << "' cmd=" << m->cmd << ": dispatch";
+  (cmd_is_rw ? audit_clog->info() : audit_clog->debug())
+    << "from='" << session->inst << "' "
+    << "entity='" << session->entity_name << "' "
+    << "cmd=" << m->cmd << ": dispatch";
 
   if (module == "mds" || module == "fs") {
     mdsmon()->dispatch(m);
@@ -2535,11 +2487,7 @@ void Monitor::handle_command(MMonCommand *m)
   }
 
   if (prefix == "scrub") {
-    while (paxos->is_writing() || paxos->is_writing_previous()) {
-      lock.Unlock();
-      store->flush();
-      lock.Lock();
-    }
+    wait_for_paxos_write();
     if (is_leader()) {
       int r = scrub();
       reply_command(m, r, "", rdata, 0);
@@ -2593,13 +2541,19 @@ void Monitor::handle_command(MMonCommand *m)
       }
       rdata.append(ds);
     } else if (prefix == "health") {
-      string health_str;
+      list<string> health_str;
       get_health(health_str, detail == "detail" ? &rdata : NULL, f.get());
       if (f) {
         f->flush(ds);
         ds << '\n';
       } else {
-        ds << health_str;
+	assert(!health_str.empty());
+	ds << health_str.front();
+	health_str.pop_front();
+	if (!health_str.empty()) {
+	  ds << ' ';
+	  ds << joinify(health_str.begin(), health_str.end(), string("; "));
+	}
       }
       bufferlist comb;
       comb.append(ds);
@@ -2647,7 +2601,7 @@ void Monitor::handle_command(MMonCommand *m)
       tagstr = tagstr.substr(0, tagstr.find_last_of(' '));
     f->dump_string("tag", tagstr);
 
-    string hs;
+    list<string> hs;
     get_health(hs, NULL, f.get());
 
     monmon()->dump_info(f.get());
@@ -2791,6 +2745,11 @@ void Monitor::forward_request_leader(PaxosServiceMessage *req)
 				     rr->con_features,
 				     rr->session->caps);
     forward->set_priority(req->get_priority());
+    if (session->auth_handler) {
+      forward->entity_name = session->entity_name;
+    } else if (req->get_source().is_mon()) {
+      forward->entity_name.set_type(CEPH_ENTITY_TYPE_MON);
+    }
     messenger->send_message(forward, monmap->get_inst(mon));
   } else {
     dout(10) << "forward_request no session for request " << *req << dendl;
@@ -2824,6 +2783,9 @@ void Monitor::handle_forward(MForward *m)
 
     s->caps = m->client_caps;
     dout(10) << " caps are " << s->caps << dendl;
+    s->entity_name = m->entity_name;
+    dout(10) << " entity name '" << s->entity_name << "' type "
+             << s->entity_name.get_type() << dendl;
     s->proxy_con = m->get_connection();
     s->proxy_tid = m->tid;
 
@@ -3081,7 +3043,6 @@ void Monitor::_ms_dispatch(Message *m)
   ConnectionRef connection = m->get_connection();
   MonSession *s = NULL;
   MonCap caps;
-  EntityName entity_name;
   bool src_is_mon;
 
   // regardless of who we are or who the sender is, the message must
@@ -3152,7 +3113,7 @@ void Monitor::_ms_dispatch(Message *m)
 
   if (s) {
     if (s->auth_handler) {
-      entity_name = s->auth_handler->get_entity_name();
+      s->entity_name = s->auth_handler->get_entity_name();
     }
     dout(20) << " caps " << s->caps.get_str() << dendl;
   }
@@ -3175,51 +3136,49 @@ void Monitor::dispatch(MonSession *s, Message *m, const bool src_is_mon)
 {
   assert(m != NULL);
 
+  /* deal with all messages that do not necessarily need caps */
+  bool dealt_with = true;
   switch (m->get_type()) {
-
-    case MSG_ROUTE:
-      handle_route(static_cast<MRoute*>(m));
+    // auth
+    case MSG_MON_GLOBAL_ID:
+    case CEPH_MSG_AUTH:
+      /* no need to check caps here */
+      paxos_service[PAXOS_AUTH]->dispatch((PaxosServiceMessage*)m);
       break;
 
-    // misc
+    case CEPH_MSG_PING:
+      handle_ping(static_cast<MPing*>(m));
+      break;
+
+    /* MMonGetMap may be used by clients to obtain a monmap *before*
+     * authenticating with the monitor.  We need to handle these without
+     * checking caps because, even on a cluster without cephx, we only set
+     * session caps *after* the auth handshake.  A good example of this
+     * is when a client calls MonClient::get_monmap_privately(), which does
+     * not authenticate when obtaining a monmap.
+     */
     case CEPH_MSG_MON_GET_MAP:
       handle_mon_get_map(static_cast<MMonGetMap*>(m));
       break;
 
-    case CEPH_MSG_MON_GET_VERSION:
-      handle_get_version(static_cast<MMonGetVersion*>(m));
+    default:
+      dealt_with = false;
       break;
+  }
+  if (dealt_with)
+    return;
 
-    case MSG_MON_COMMAND:
-      handle_command(static_cast<MMonCommand*>(m));
-      break;
-
-    case CEPH_MSG_MON_SUBSCRIBE:
-      /* FIXME: check what's being subscribed, filter accordingly */
-      handle_subscribe(static_cast<MMonSubscribe*>(m));
-      break;
-
-    case MSG_MON_PROBE:
-      handle_probe(static_cast<MMonProbe*>(m));
-      break;
-
-    // Sync (i.e., the new slurp, but on steroids)
-    case MSG_MON_SYNC:
-      handle_sync(static_cast<MMonSync*>(m));
-      break;
-    case MSG_MON_SCRUB:
-      handle_scrub(static_cast<MMonScrub*>(m));
-      break;
+  /* deal with all messages which caps should be checked somewhere else */
+  dealt_with = true;
+  switch (m->get_type()) {
 
     // OSDs
+    case CEPH_MSG_MON_GET_OSDMAP:
     case MSG_OSD_MARK_ME_DOWN:
     case MSG_OSD_FAILURE:
     case MSG_OSD_BOOT:
     case MSG_OSD_ALIVE:
     case MSG_OSD_PGTEMP:
-      paxos_service[PAXOS_OSDMAP]->dispatch((PaxosServiceMessage*)m);
-      break;
-
     case MSG_REMOVE_SNAPS:
       paxos_service[PAXOS_OSDMAP]->dispatch((PaxosServiceMessage*)m);
       break;
@@ -3230,12 +3189,6 @@ void Monitor::dispatch(MonSession *s, Message *m, const bool src_is_mon)
       paxos_service[PAXOS_MDSMAP]->dispatch((PaxosServiceMessage*)m);
       break;
 
-    // auth
-    case MSG_MON_GLOBAL_ID:
-    case CEPH_MSG_AUTH:
-      /* no need to check caps here */
-      paxos_service[PAXOS_AUTH]->dispatch((PaxosServiceMessage*)m);
-      break;
 
     // pg
     case CEPH_MSG_STATFS:
@@ -3253,6 +3206,77 @@ void Monitor::dispatch(MonSession *s, Message *m, const bool src_is_mon)
       paxos_service[PAXOS_LOG]->dispatch((PaxosServiceMessage*)m);
       break;
 
+    // handle_command() does its own caps checking
+    case MSG_MON_COMMAND:
+      handle_command(static_cast<MMonCommand*>(m));
+      break;
+
+    default:
+      dealt_with = false;
+      break;
+  }
+  if (dealt_with)
+    return;
+
+  /* messages we, the Monitor class, need to deal with
+   * but may be sent by clients. */
+
+  if (!s->is_capable("mon", MON_CAP_R)) {
+    dout(5) << __func__ << " " << m->get_source_inst()
+            << " not enough caps for " << *m << " -- dropping"
+            << dendl;
+    goto drop;
+  }
+
+  dealt_with = true;
+  switch (m->get_type()) {
+
+    // misc
+    case CEPH_MSG_MON_GET_VERSION:
+      handle_get_version(static_cast<MMonGetVersion*>(m));
+      break;
+
+    case CEPH_MSG_MON_SUBSCRIBE:
+      /* FIXME: check what's being subscribed, filter accordingly */
+      handle_subscribe(static_cast<MMonSubscribe*>(m));
+      break;
+
+    default:
+      dealt_with = false;
+      break;
+  }
+  if (dealt_with)
+    return;
+
+  if (!src_is_mon) {
+    dout(1) << __func__ << " unexpected monitor message from"
+            << " non-monitor entity " << m->get_source_inst()
+            << " " << *m << " -- dropping" << dendl;
+    goto drop;
+  }
+
+  /* messages that should only be sent by another monitor */
+  dealt_with = true;
+  switch (m->get_type()) {
+
+    case MSG_ROUTE:
+      handle_route(static_cast<MRoute*>(m));
+      break;
+
+    case MSG_MON_PROBE:
+      handle_probe(static_cast<MMonProbe*>(m));
+      break;
+
+    // Sync (i.e., the new slurp, but on steroids)
+    case MSG_MON_SYNC:
+      handle_sync(static_cast<MMonSync*>(m));
+      break;
+    case MSG_MON_SCRUB:
+      handle_scrub(static_cast<MMonScrub*>(m));
+      break;
+
+    /* log acks are sent from a monitor we sent the MLog to, and are
+       never sent by clients to us. */
     case MSG_LOGACK:
       log_client.handle_log_ack((MLogAck*)m);
       m->put();
@@ -3327,15 +3351,18 @@ void Monitor::dispatch(MonSession *s, Message *m, const bool src_is_mon)
       health_monitor->dispatch(static_cast<MMonHealth *>(m));
       break;
 
-    case CEPH_MSG_PING:
-      handle_ping(static_cast<MPing*>(m));
-      break;
-
     default:
-      dout(1) << "dropping unexpected " << *m << dendl;
-      m->put();
+      dealt_with = false;
       break;
   }
+  if (!dealt_with) {
+    dout(1) << "dropping unexpected " << *m << dendl;
+    goto drop;
+  }
+  return;
+
+drop:
+  m->put();
 }
 
 void Monitor::handle_ping(MPing *m)
@@ -3347,7 +3374,7 @@ void Monitor::handle_ping(MPing *m)
   Formatter *f = new JSONFormatter(true);
   f->open_object_section("pong");
 
-  string health_str;
+  list<string> health_str;
   get_health(health_str, NULL, f);
   {
     stringstream ss;

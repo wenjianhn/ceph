@@ -1,6 +1,7 @@
 #!/bin/bash
 #
 # Copyright (C) 2013,2014 Cloudwatt <libre.licensing@cloudwatt.com>
+# Copyright (C) 2014 Red Hat <contact@redhat.com>
 #
 # Author: Loic Dachary <loic@dachary.org>
 #
@@ -19,9 +20,10 @@ source test/mon/mon-test-helpers.sh
 function run() {
     local dir=$1
 
+    export CEPH_MON="127.0.0.1:7105"
     export CEPH_ARGS
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
-    CEPH_ARGS+="--mon-host=127.0.0.1 "
+    CEPH_ARGS+="--mon-host=$CEPH_MON "
 
     FUNCTIONS=${FUNCTIONS:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
     for TEST_function in $FUNCTIONS ; do
@@ -35,9 +37,10 @@ function TEST_default_deprectated_0() {
     local dir=$1
     # explicitly set the default crush rule
     expected=66
-    run_mon $dir a --public-addr 127.0.0.1 \
+    run_mon $dir a --public-addr $CEPH_MON \
         --osd_pool_default_crush_replicated_ruleset $expected
     ./ceph --format json osd dump | grep '"crush_ruleset":'$expected
+    CEPH_ARGS='' ./ceph --admin-daemon $dir/a/ceph-mon.a.asok log flush || return 1
     ! grep "osd_pool_default_crush_rule is deprecated " $dir/a/log || return 1
 }
 
@@ -45,9 +48,10 @@ function TEST_default_deprectated_1() {
     local dir=$1
     # explicitly set the default crush rule using deprecated option
     expected=55
-    run_mon $dir a --public-addr 127.0.0.1 \
+    run_mon $dir a --public-addr $CEPH_MON \
         --osd_pool_default_crush_rule $expected
     ./ceph --format json osd dump | grep '"crush_ruleset":'$expected
+    CEPH_ARGS='' ./ceph --admin-daemon $dir/a/ceph-mon.a.asok log flush || return 1
     grep "osd_pool_default_crush_rule is deprecated " $dir/a/log || return 1
 }
 
@@ -55,18 +59,19 @@ function TEST_default_deprectated_2() {
     local dir=$1
     expected=77
     unexpected=33
-    run_mon $dir a --public-addr 127.0.0.1 \
+    run_mon $dir a --public-addr $CEPH_MON \
         --osd_pool_default_crush_rule $expected \
         --osd_pool_default_crush_replicated_ruleset $unexpected
     ./ceph --format json osd dump | grep '"crush_ruleset":'$expected
     ! ./ceph --format json osd dump | grep '"crush_ruleset":'$unexpected || return 1
+    CEPH_ARGS='' ./ceph --admin-daemon $dir/a/ceph-mon.a.asok log flush || return 1
     grep "osd_pool_default_crush_rule is deprecated " $dir/a/log || return 1
 }
 
 # Before http://tracker.ceph.com/issues/8307 the invalid profile was created
 function TEST_erasure_invalid_profile() {
     local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
+    run_mon $dir a --public-addr $CEPH_MON
     local poolname=pool_erasure
     local notaprofile=not-a-valid-erasure-code-profile
     ! ./ceph osd pool create $poolname 12 12 erasure $notaprofile || return 1
@@ -75,7 +80,7 @@ function TEST_erasure_invalid_profile() {
 
 function TEST_erasure_crush_rule() {
     local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
+    run_mon $dir a --public-addr $CEPH_MON
     # 
     # choose the crush ruleset used with an erasure coded pool
     #
@@ -95,63 +100,27 @@ function TEST_erasure_crush_rule() {
     ./ceph osd erasure-code-profile set myprofile
     ./ceph osd pool create $poolname 12 12 erasure myprofile
     ./ceph osd crush rule ls | grep $poolname || return 1
-}
-
-function TEST_erasure_crush_rule_pending() {
-    local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
-    ./ceph osd erasure-code-profile ls
-    # try again if the ruleset creation is pending
-    crush_ruleset=erasure_ruleset
-    # add to the pending OSD map without triggering a paxos proposal
-    result=$(echo '{"prefix":"osdmonitor_prepare_command","prepare":"osd crush rule create-erasure","name":"'$crush_ruleset'"}' | nc -U $dir/a/ceph-mon.a.asok | cut --bytes=5-)
-    test $result = true || return 1
-    ./ceph osd pool create pool_erasure 12 12 erasure default $crush_ruleset || return 1
-    grep "$crush_ruleset try again" $dir/a/log || return 1
-}
-
-function TEST_simple_crush_rule_pending() {
-    local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
-    ./ceph osd erasure-code-profile ls
-    # try again if the ruleset creation is pending
-    crush_ruleset=simple_ruleset
-    ./ceph osd crush add-bucket host1 host
-    # add to the pending OSD map without triggering a paxos proposal
-    result=$(echo '{"prefix":"osdmonitor_prepare_command","prepare":"osd crush rule create-simple","name":"'$crush_ruleset'","root":"host1","type":"host"}' | nc -U $dir/a/ceph-mon.a.asok | cut --bytes=5-)
-    test $result = true || return 1
-    ./ceph osd pool create pool_simple 12 12 replicated $crush_ruleset || return 1
-    CEPH_ARGS='' ./ceph --admin-daemon $dir/a/ceph-mon.a.asok log flush || return 1
-    grep "$crush_ruleset is pending, try again" $dir/a/log || return 1
+    #
+    # a non existent crush ruleset given in argument is an error
+    # http://tracker.ceph.com/issues/9304
+    #
+    poolname=pool_erasure3
+    ! ./ceph osd pool create $poolname 12 12 erasure myprofile INVALIDRULESET || return 1
 }
 
 function TEST_erasure_code_profile_default() {
     local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
+    run_mon $dir a --public-addr $CEPH_MON
     ./ceph osd erasure-code-profile rm default || return 1
     ! ./ceph osd erasure-code-profile ls | grep default || return 1
     ./ceph osd pool create $poolname 12 12 erasure default
     ./ceph osd erasure-code-profile ls | grep default || return 1
 }
 
-function TEST_erasure_code_profile_default_pending() {
-    local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
-    ./ceph osd erasure-code-profile ls
-    ./ceph osd erasure-code-profile rm default || return 1
-    ! ./ceph osd erasure-code-profile ls | grep default || return 1
-    # add to the pending OSD map without triggering a paxos proposal
-    result=$(echo '{"prefix":"osdmonitor_prepare_command","prepare":"osd erasure-code-profile set","name":"default"}' | nc -U $dir/a/ceph-mon.a.asok | cut --bytes=5-)
-    test $result = true || return 1
-    ./ceph osd pool create pool_erasure 12 12 erasure default || return 1
-    CEPH_ARGS='' ./ceph --admin-daemon $dir/a/ceph-mon.a.asok log flush || return 1
-    grep 'profile default already pending' $dir/a/log || return 1
-}
-
 function TEST_erasure_crush_stripe_width() {
     local dir=$1
     # the default stripe width is used to initialize the pool
-    run_mon $dir a --public-addr 127.0.0.1
+    run_mon $dir a --public-addr $CEPH_MON
     stripe_width=$(./ceph-conf --show-config-value osd_pool_erasure_code_stripe_width)
     ./ceph osd pool create pool_erasure 12 12 erasure
     ./ceph --format json osd dump | tee $dir/osd.json
@@ -170,7 +139,7 @@ function TEST_erasure_crush_stripe_width_padded() {
     expected_chunk_size=2048
     actual_stripe_width=$(($expected_chunk_size * $k))
     desired_stripe_width=$(($actual_stripe_width - 1))
-    run_mon $dir a --public-addr 127.0.0.1 \
+    run_mon $dir a --public-addr $CEPH_MON \
         --osd_pool_erasure_code_stripe_width $desired_stripe_width \
         --osd_pool_default_erasure_code_profile "$profile"
     ./ceph osd pool create pool_erasure 12 12 erasure
@@ -180,7 +149,7 @@ function TEST_erasure_crush_stripe_width_padded() {
 
 function TEST_erasure_code_pool() {
     local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
+    run_mon $dir a --public-addr $CEPH_MON
     ./ceph --format json osd dump > $dir/osd.json
     local expected='"erasure_code_profile":"default"'
     ! grep "$expected" $dir/osd.json || return 1
@@ -196,7 +165,7 @@ function TEST_erasure_code_pool() {
 
 function TEST_replicated_pool_with_ruleset() {
     local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
+    run_mon $dir a --public-addr $CEPH_MON
     local ruleset=ruleset0
     local root=host1
     ./ceph osd crush add-bucket $root host
@@ -216,7 +185,7 @@ function TEST_replicated_pool_with_ruleset() {
 
 function TEST_erasure_code_pool_lrc() {
     local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
+    run_mon $dir a --public-addr $CEPH_MON
 
     ./ceph osd erasure-code-profile set LRCprofile \
              plugin=lrc \
@@ -235,11 +204,12 @@ function TEST_erasure_code_pool_lrc() {
 
 function TEST_replicated_pool() {
     local dir=$1
-    run_mon $dir a --public-addr 127.0.0.1
-    ./ceph osd pool create replicated 12 12 replicated 2>&1 | \
+    run_mon $dir a --public-addr $CEPH_MON
+    ./ceph osd pool create replicated 12 12 replicated replicated_ruleset 2>&1 | \
         grep "pool 'replicated' created" || return 1
-    ./ceph osd pool create replicated 12 12 replicated 2>&1 | \
+    ./ceph osd pool create replicated 12 12 replicated replicated_ruleset 2>&1 | \
         grep 'already exists' || return 1
+    ! ./ceph osd pool create replicated0 12 12 replicated INVALIDRULESET
     # default is replicated
     ./ceph osd pool create replicated1 12 12 2>&1 | \
         grep "pool 'replicated1' created" || return 1

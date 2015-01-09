@@ -135,6 +135,8 @@ using ceph::crypto::MD5;
 #define ERR_PERMANENT_REDIRECT   2024
 #define ERR_LOCKED               2025
 #define ERR_QUOTA_EXCEEDED       2026
+#define ERR_SIGNATURE_NO_MATCH   2027
+#define ERR_INVALID_ACCESS_KEY   2028
 #define ERR_USER_SUSPENDED       2100
 #define ERR_INTERNAL_ERROR       2200
 
@@ -872,6 +874,8 @@ struct RGWStorageStats
   uint64_t num_objects;
 
   RGWStorageStats() : category(RGW_OBJ_CATEGORY_NONE), num_kb(0), num_kb_rounded(0), num_objects(0) {}
+
+  void dump(Formatter *f) const;
 };
 
 struct req_state;
@@ -930,6 +934,7 @@ struct req_state {
    ACLOwner bucket_owner;
    ACLOwner owner;
 
+   string region_endpoint;
    string bucket_instance_id;
 
    RGWBucketInfo bucket_info;

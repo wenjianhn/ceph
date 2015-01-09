@@ -30,9 +30,8 @@ class CephContext;
 struct Connection;
 struct md_config_t;
 class Message;
-class MWatchNotify;
 class MLog;
-class SimpleMessenger;
+class Messenger;
 
 class librados::RadosClient : public Dispatcher
 {
@@ -47,7 +46,7 @@ private:
   } state;
 
   MonClient monclient;
-  SimpleMessenger *messenger;
+  Messenger *messenger;
 
   uint64_t instance_id;
 
@@ -82,6 +81,8 @@ public:
   int connect();
   void shutdown();
 
+  int watch_flush();
+
   uint64_t get_instance_id();
 
   int wait_for_latest_osdmap();
@@ -102,19 +103,10 @@ public:
   int pool_create(string& name, unsigned long long auid=0, __u8 crush_rule=0);
   int pool_create_async(string& name, PoolAsyncCompletionImpl *c, unsigned long long auid=0,
 			__u8 crush_rule=0);
+  int pool_get_base_tier(int64_t pool_id, int64_t* base_tier);
   int pool_delete(const char *name);
 
   int pool_delete_async(const char *name, PoolAsyncCompletionImpl *c);
-
-  // watch/notify
-  uint64_t max_watch_notify_cookie;
-  map<uint64_t, librados::WatchNotifyInfo *> watch_notify_info;
-
-  void register_watch_notify_callback(librados::WatchNotifyInfo *wc,
-				      uint64_t *cookie);
-  void unregister_watch_notify_callback(uint64_t cookie);
-  void handle_watch_notify(MWatchNotify *m);
-  void do_watch_notify(MWatchNotify *m);
 
   int mon_command(const vector<string>& cmd, const bufferlist &inbl,
 	          bufferlist *outbl, string *outs);

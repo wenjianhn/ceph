@@ -40,6 +40,7 @@
 #include "Watch.h"
 #include "OpRequest.h"
 #include "include/cmp.h"
+#include "librados/ListObjectImpl.h"
 
 #define CEPH_OSD_ONDISK_MAGIC "ceph osd volume v026"
 
@@ -55,6 +56,7 @@
 #define CEPH_OSD_FEATURE_INCOMPAT_SNAPMAPPER CompatSet::Feature(10, "snapmapper")
 #define CEPH_OSD_FEATURE_INCOMPAT_SHARDS CompatSet::Feature(11, "sharded objects")
 #define CEPH_OSD_FEATURE_INCOMPAT_HINTS CompatSet::Feature(12, "transaction hints")
+#define CEPH_OSD_FEATURE_INCOMPAT_PGMETA CompatSet::Feature(13, "pg meta object")
 
 
 /// max recovery priority for MBackfillReserve
@@ -65,9 +67,13 @@ typedef hobject_t collection_list_handle_t;
 
 /// convert a single CPEH_OSD_FLAG_* to a string
 const char *ceph_osd_flag_name(unsigned flag);
+/// convert a single CEPH_OSD_OF_FLAG_* to a string
+const char *ceph_osd_op_flag_name(unsigned flag);
 
 /// convert CEPH_OSD_FLAG_* op flags to a string
 string ceph_osd_flag_string(unsigned flags);
+/// conver CEPH_OSD_OP_FLAG_* op flags to a string
+string ceph_osd_op_flag_string(unsigned flags);
 
 struct pg_shard_t {
   int32_t osd;
@@ -270,17 +276,15 @@ struct pg_t {
   int32_t m_preferred;
 
   pg_t() : m_pool(0), m_seed(0), m_preferred(-1) {}
-  pg_t(ps_t seed, uint64_t pool, int pref=-1) {
-    m_seed = seed;
-    m_pool = pool;
-    m_preferred = pref;
+  pg_t(ps_t seed, uint64_t pool, int pref=-1) :
+    m_pool(pool), m_seed(seed), m_preferred(pref) {}
+  pg_t(const ceph_pg& cpg) :
+    m_pool(cpg.pool), m_seed(cpg.ps), m_preferred((__s16)cpg.preferred) {}
+
+  pg_t(const old_pg_t& opg) {
+    *this = opg.v;
   }
 
-  pg_t(const ceph_pg& cpg) {
-    m_pool = cpg.pool;
-    m_seed = cpg.ps;
-    m_preferred = (__s16)cpg.preferred;
-  }
   old_pg_t get_old_pg() const {
     old_pg_t o;
     assert(m_pool < 0xffffffffull);
@@ -288,9 +292,6 @@ struct pg_t {
     o.v.ps = m_seed;
     o.v.preferred = (__s16)m_preferred;
     return o;
-  }
-  pg_t(const old_pg_t& opg) {
-    *this = opg.v;
   }
 
   ps_t ps() const {
@@ -434,6 +435,11 @@ struct spg_t {
   bool is_no_shard() const {
     return shard == shard_id_t::NO_SHARD;
   }
+
+  ghobject_t make_pgmeta_oid() const {
+    return ghobject_t::make_pgmeta(pgid.pool(), pgid.ps(), shard);
+  }
+
   void encode(bufferlist &bl) const {
     ENCODE_START(1, 1, bl);
     ::encode(pgid, bl);
@@ -484,10 +490,6 @@ public:
     return coll_t(pg_to_tmp_str(pgid));
   }
 
-  static coll_t make_removal_coll(uint64_t seq, spg_t pgid) {
-    return coll_t(seq_to_removal_str(seq, pgid));
-  }
-
   const std::string& to_str() const {
     return str;
   }
@@ -525,11 +527,6 @@ private:
   static std::string pg_to_tmp_str(spg_t p) {
     std::ostringstream oss;
     oss << p << "_TEMP";
-    return oss.str();
-  }
-  static std::string seq_to_removal_str(uint64_t seq, spg_t pgid) {
-    std::ostringstream oss;
-    oss << "FORREMOVAL_" << seq << "_" << pgid;
     return oss.str();
   }
 
@@ -655,6 +652,11 @@ struct objectstore_perf_stat_t {
   objectstore_perf_stat_t() :
     filestore_commit_latency(0), filestore_apply_latency(0) {}
 
+  bool operator==(const objectstore_perf_stat_t &r) const {
+    return filestore_commit_latency == r.filestore_commit_latency &&
+      filestore_apply_latency == r.filestore_apply_latency;
+  }
+
   void add(const objectstore_perf_stat_t &o) {
     filestore_commit_latency += o.filestore_commit_latency;
     filestore_apply_latency += o.filestore_apply_latency;
@@ -718,7 +720,9 @@ inline bool operator==(const osd_stat_t& l, const osd_stat_t& r) {
     l.snap_trim_queue_len == r.snap_trim_queue_len &&
     l.num_snap_trimming == r.num_snap_trimming &&
     l.hb_in == r.hb_in &&
-    l.hb_out == r.hb_out;
+    l.hb_out == r.hb_out &&
+    l.op_queue_age_hist == r.op_queue_age_hist &&
+    l.fs_perf_stat == r.fs_perf_stat;
 }
 inline bool operator!=(const osd_stat_t& l, const osd_stat_t& r) {
   return !(l == r);
@@ -1297,12 +1301,9 @@ WRITE_CLASS_ENCODER(object_stat_sum_t)
  */
 struct object_stat_collection_t {
   object_stat_sum_t sum;
-  map<string,object_stat_sum_t> cat_sum;
 
   void calc_copies(int nrep) {
     sum.calc_copies(nrep);
-    for (map<string,object_stat_sum_t>::iterator p = cat_sum.begin(); p != cat_sum.end(); ++p)
-      p->second.calc_copies(nrep);
   }
 
   void dump(Formatter *f) const;
@@ -1311,43 +1312,26 @@ struct object_stat_collection_t {
   static void generate_test_instances(list<object_stat_collection_t*>& o);
 
   bool is_zero() const {
-    return (cat_sum.empty() && sum.is_zero());
+    return sum.is_zero();
   }
 
   void clear() {
     sum.clear();
-    cat_sum.clear();
   }
 
   void floor(int64_t f) {
     sum.floor(f);
-    for (map<string,object_stat_sum_t>::iterator p = cat_sum.begin(); p != cat_sum.end(); ++p)
-      p->second.floor(f);
   }
 
-  void add(const object_stat_sum_t& o, const string& cat) {
+  void add(const object_stat_sum_t& o) {
     sum.add(o);
-    if (cat.length())
-      cat_sum[cat].add(o);
   }
 
   void add(const object_stat_collection_t& o) {
     sum.add(o.sum);
-    for (map<string,object_stat_sum_t>::const_iterator p = o.cat_sum.begin();
-	 p != o.cat_sum.end();
-	 ++p)
-      cat_sum[p->first].add(p->second);
   }
   void sub(const object_stat_collection_t& o) {
     sum.sub(o.sum);
-    for (map<string,object_stat_sum_t>::const_iterator p = o.cat_sum.begin();
-	 p != o.cat_sum.end();
-	 ++p) {
-      object_stat_sum_t& s = cat_sum[p->first];
-      s.sub(p->second);
-      if (s.is_zero())
-	cat_sum.erase(p->first);
-    }
   }
 };
 WRITE_CLASS_ENCODER(object_stat_collection_t)
@@ -1471,8 +1455,10 @@ struct pool_stat_t {
   object_stat_collection_t stats;
   int64_t log_size;
   int64_t ondisk_log_size;    // >= active_log_size
+  int32_t up;       ///< number of up replicas or shards
+  int32_t acting;   ///< number of acting replicas or shards
 
-  pool_stat_t() : log_size(0), ondisk_log_size(0)
+  pool_stat_t() : log_size(0), ondisk_log_size(0), up(0), acting(0)
   { }
 
   void floor(int64_t f) {
@@ -1481,23 +1467,33 @@ struct pool_stat_t {
       log_size = f;
     if (ondisk_log_size < f)
       ondisk_log_size = f;
+    if (up < f)
+      up = f;
+    if (acting < f)
+      acting = f;
   }
 
   void add(const pg_stat_t& o) {
     stats.add(o.stats);
     log_size += o.log_size;
     ondisk_log_size += o.ondisk_log_size;
+    up += o.up.size();
+    acting += o.acting.size();
   }
   void sub(const pg_stat_t& o) {
     stats.sub(o.stats);
     log_size -= o.log_size;
     ondisk_log_size -= o.ondisk_log_size;
+    up -= o.up.size();
+    acting -= o.acting.size();
   }
 
   bool is_zero() const {
     return (stats.is_zero() &&
 	    log_size == 0 &&
-	    ondisk_log_size == 0);
+	    ondisk_log_size == 0 &&
+	    up == 0 &&
+	    acting == 0);
   }
 
   void dump(Formatter *f) const;
@@ -1772,6 +1768,25 @@ struct pg_interval_t {
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
   static void generate_test_instances(list<pg_interval_t*>& o);
+
+  /**
+   * Determines whether there is an interval change
+   */
+  static bool is_new_interval(
+    int old_acting_primary,
+    int new_acting_primary,
+    const vector<int> &old_acting,
+    const vector<int> &new_acting,
+    int old_up_primary,
+    int new_up_primary,
+    const vector<int> &old_up,
+    const vector<int> &new_up,
+    int old_min_size,
+    int new_min_size,
+    unsigned old_pg_num,
+    unsigned new_pg_num,
+    pg_t pgid
+    );
 
   /**
    * Determines whether there is an interval change
@@ -2321,6 +2336,75 @@ ostream& operator<<(ostream& out, const pg_missing_t& missing);
  * pg list objects response format
  *
  */
+struct pg_nls_response_t {
+  collection_list_handle_t handle;
+  list<librados::ListObjectImpl> entries;
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(handle, bl);
+    __u32 n = (__u32)entries.size();
+    ::encode(n, bl);
+    for (list<librados::ListObjectImpl>::const_iterator i = entries.begin(); i != entries.end(); ++i) {
+      ::encode(i->nspace, bl);
+      ::encode(i->oid, bl);
+      ::encode(i->locator, bl);
+    }
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator& bl) {
+    DECODE_START(1, bl);
+    ::decode(handle, bl);
+    __u32 n;
+    ::decode(n, bl);
+    entries.clear();
+    while (n--) {
+      librados::ListObjectImpl i;
+      ::decode(i.nspace, bl);
+      ::decode(i.oid, bl);
+      ::decode(i.locator, bl);
+      entries.push_back(i);
+    }
+    DECODE_FINISH(bl);
+  }
+  void dump(Formatter *f) const {
+    f->dump_stream("handle") << handle;
+    f->open_array_section("entries");
+    for (list<librados::ListObjectImpl>::const_iterator p = entries.begin(); p != entries.end(); ++p) {
+      f->open_object_section("object");
+      f->dump_string("namespace", p->nspace);
+      f->dump_string("object", p->oid);
+      f->dump_string("key", p->locator);
+      f->close_section();
+    }
+    f->close_section();
+  }
+  static void generate_test_instances(list<pg_nls_response_t*>& o) {
+    o.push_back(new pg_nls_response_t);
+    o.push_back(new pg_nls_response_t);
+    o.back()->handle = hobject_t(object_t("hi"), "key", 1, 2, -1, "");
+    o.back()->entries.push_back(librados::ListObjectImpl("", "one", ""));
+    o.back()->entries.push_back(librados::ListObjectImpl("", "two", "twokey"));
+    o.back()->entries.push_back(librados::ListObjectImpl("", "three", ""));
+    o.push_back(new pg_nls_response_t);
+    o.back()->handle = hobject_t(object_t("hi"), "key", 3, 4, -1, "");
+    o.back()->entries.push_back(librados::ListObjectImpl("n1", "n1one", ""));
+    o.back()->entries.push_back(librados::ListObjectImpl("n1", "n1two", "n1twokey"));
+    o.back()->entries.push_back(librados::ListObjectImpl("n1", "n1three", ""));
+    o.push_back(new pg_nls_response_t);
+    o.back()->handle = hobject_t(object_t("hi"), "key", 5, 6, -1, "");
+    o.back()->entries.push_back(librados::ListObjectImpl("", "one", ""));
+    o.back()->entries.push_back(librados::ListObjectImpl("", "two", "twokey"));
+    o.back()->entries.push_back(librados::ListObjectImpl("", "three", ""));
+    o.back()->entries.push_back(librados::ListObjectImpl("n1", "n1one", ""));
+    o.back()->entries.push_back(librados::ListObjectImpl("n1", "n1two", "n1twokey"));
+    o.back()->entries.push_back(librados::ListObjectImpl("n1", "n1three", ""));
+  }
+};
+
+WRITE_CLASS_ENCODER(pg_nls_response_t)
+
+// For backwards compatibility with older OSD requests
 struct pg_ls_response_t {
   collection_list_handle_t handle; 
   list<pair<object_t, string> > entries;
@@ -2413,7 +2497,6 @@ struct object_copy_data_t {
   bufferlist data;
   bufferlist omap_header;
   map<string, bufferlist> omap;
-  string category;
 
   /// which snaps we are defined for (if a snap and not the head)
   vector<snapid_t> snaps;
@@ -2650,8 +2733,6 @@ static inline ostream& operator<<(ostream& out, const notify_info_t& n) {
 
 struct object_info_t {
   hobject_t soid;
-  string category;
-
   eversion_t version, prior_version;
   version_t user_version;
   osd_reqid_t last_reqid;
@@ -3222,7 +3303,6 @@ struct ScrubMap {
   WRITE_CLASS_ENCODER(object)
 
   map<hobject_t,object> objects;
-  map<string,bufferptr> attrs;
   eversion_t valid_through;
   eversion_t incr_since;
 

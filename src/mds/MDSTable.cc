@@ -88,16 +88,15 @@ void MDSTable::save(MDSInternalContextBase *onfinish, version_t v)
 
 void MDSTable::save_2(int r, version_t v)
 {
-  dout(10) << "save_2 v " << v << dendl;
-  if (r == -EBLACKLISTED) {
-    mds->suicide();
+  if (r < 0) {
+    dout(1) << "save error " << r << " v " << v << dendl;
+    mds->clog->error() << "failed to store table " << table_name << " object,"
+		       << " errno " << r << "\n";
+    mds->handle_write_error(r);
     return;
   }
-  if (r < 0) {
-    dout(10) << "save_2 could not write table: " << r << dendl;
-    assert(r >= 0);
-  }
-  assert(r >= 0);
+
+  dout(10) << "save_2 v " << v << dendl;
   committed_version = v;
   
   list<MDSInternalContextBase*> ls;
@@ -134,7 +133,7 @@ object_t MDSTable::get_object_name()
 {
   char n[50];
   if (per_mds)
-    snprintf(n, sizeof(n), "mds%d_%s", mds->whoami, table_name);
+    snprintf(n, sizeof(n), "mds%d_%s", int(mds->whoami), table_name);
   else
     snprintf(n, sizeof(n), "mds_%s", table_name);
   return object_t(n);

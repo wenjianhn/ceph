@@ -106,6 +106,7 @@ public:
   static const unsigned STATE_DNPINNEDFRAG =  (1<<16);  // dir is refragmenting
   static const unsigned STATE_ASSIMRSTAT =    (1<<17);  // assimilating inode->frag rstats
   static const unsigned STATE_DIRTYDFT =      (1<<18);  // dirty dirfragtree
+  static const unsigned STATE_BADFRAG =       (1<<19);  // bad dirfrag
 
   // common states
   static const unsigned STATE_CLEAN =  0;
@@ -114,7 +115,7 @@ public:
   // these state bits are preserved by an import/export
   // ...except if the directory is hashed, in which case none of them are!
   static const unsigned MASK_STATE_EXPORTED = 
-  (STATE_COMPLETE|STATE_DIRTY|STATE_DIRTYDFT);
+  (STATE_COMPLETE|STATE_DIRTY|STATE_DIRTYDFT|STATE_BADFRAG);
   static const unsigned MASK_STATE_IMPORT_KEPT = 
   (						  
    STATE_IMPORTING
@@ -219,6 +220,8 @@ public:
 
   bool is_new() { return item_new.is_on_list(); }
   void mark_new(LogSegment *ls);
+
+  bool is_bad() { return state_test(STATE_BADFRAG); }
 
 public:
   typedef std::map<dentry_key_t, CDentry*> map_t;
@@ -360,6 +363,7 @@ private:
   void purge_stale_snap_data(const std::set<snapid_t>& snaps);
 public:
   void touch_dentries_bottom();
+  void try_remove_dentries_for_stray();
   bool try_trim_snap_dentry(CDentry *dn, const std::set<snapid_t>& snaps);
 
 
@@ -389,13 +393,13 @@ private:
    *  ambiguous: <mds1,mds2>         subtree_root
    *             <parent,mds2>       subtree_root     
    */
-  pair<int,int> dir_auth;
+  mds_authority_t dir_auth;
 
  public:
-  pair<int,int> authority();
-  pair<int,int> get_dir_auth() { return dir_auth; }
-  void set_dir_auth(pair<int,int> a);
-  void set_dir_auth(int a) { set_dir_auth(pair<int,int>(a, CDIR_AUTH_UNKNOWN)); }
+  mds_authority_t authority();
+  mds_authority_t get_dir_auth() { return dir_auth; }
+  void set_dir_auth(mds_authority_t a);
+  void set_dir_auth(mds_rank_t a) { set_dir_auth(mds_authority_t(a, CDIR_AUTH_UNKNOWN)); }
   bool is_ambiguous_dir_auth() {
     return dir_auth.second != CDIR_AUTH_UNKNOWN;
   }
@@ -414,9 +418,9 @@ private:
 
 
   // for giving to clients
-  void get_dist_spec(std::set<int>& ls, int auth) {
+  void get_dist_spec(std::set<mds_rank_t>& ls, mds_rank_t auth) {
     if (is_rep()) {
-      for (std::map<int,unsigned>::iterator p = replicas_begin();
+      for (std::map<mds_rank_t,unsigned>::iterator p = replicas_begin();
 	   p != replicas_end(); 
 	   ++p)
 	ls.insert(p->first);
@@ -424,13 +428,13 @@ private:
 	ls.insert(auth);
     }
   }
-  void encode_dirstat(bufferlist& bl, int whoami) {
+  void encode_dirstat(bufferlist& bl, mds_rank_t whoami) {
     /*
      * note: encoding matches struct ceph_client_reply_dirfrag
      */
     frag_t frag = get_frag();
-    __s32 auth;
-    std::set<__s32> dist;
+    mds_rank_t auth;
+    std::set<mds_rank_t> dist;
     
     auth = dir_auth.first;
     if (is_auth()) 
@@ -453,7 +457,7 @@ private:
     ::decode(dir_rep, p);
     ::decode(dir_rep_by, p);
   }
-  void encode_replica(int who, bufferlist& bl) {
+  void encode_replica(mds_rank_t who, bufferlist& bl) {
     __u32 nonce = add_replica(who);
     ::encode(nonce, bl);
     _encode_base(bl);
@@ -497,7 +501,7 @@ protected:
   void _commit(version_t want, int op_prio);
   void _omap_commit(int op_prio);
   void _encode_dentry(CDentry *dn, bufferlist& bl, const std::set<snapid_t> *snaps);
-  void _committed(version_t v);
+  void _committed(int r, version_t v);
 public:
 #if 0  // unused?
   void wait_for_commit(Context *c, version_t v=0);

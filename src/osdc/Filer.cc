@@ -25,6 +25,7 @@
 
 #include "include/Context.h"
 
+#include "common/Finisher.h"
 #include "common/config.h"
 
 #define dout_subsys ceph_subsys_filer
@@ -47,14 +48,13 @@ public:
 
     bool probe_complete;
     {
-      Mutex::Locker l(probe->lock);
-
-      // TODO: handle this error.
+      probe->lock.Lock();
       if (r != 0) {
         probe->err = r;
       }
 
       probe_complete = filer->_probed(probe, oid, size, mtime);
+      assert(!probe->lock.is_locked_by_me());
     }
     if (probe_complete) {
       probe->onfinish->complete(probe->err);
@@ -97,16 +97,17 @@ int Filer::probe(inodeno_t ino,
     probe->probing_off -= probe->probing_len;
   }
   
-  // Take lock before starting any I/Os, to protect us from concurrent calls
-  // back into C_Probe from OSD op completions from different OSDs
-  {
-    Mutex::Locker l(probe->lock);
-    _probe(probe);
-  }
+  probe->lock.Lock();
+  _probe(probe);
+  assert(!probe->lock.is_locked_by_me());
+
   return 0;
 }
 
 
+/**
+ * probe->lock must be initially locked, this function will release it
+ */
 void Filer::_probe(Probe *probe)
 {
   assert(probe->lock.is_locked_by_me());
@@ -121,18 +122,28 @@ void Filer::_probe(Probe *probe)
   Striper::file_to_extents(cct, probe->ino, &probe->layout,
 			   probe->probing_off, probe->probing_len, 0, probe->probing);
   
+  std::vector<ObjectExtent> stat_extents;
   for (vector<ObjectExtent>::iterator p = probe->probing.begin();
        p != probe->probing.end();
        ++p) {
     ldout(cct, 10) << "_probe  probing " << p->oid << dendl;
-    C_Probe *c = new C_Probe(this, probe, p->oid);
-    objecter->stat(p->oid, p->oloc, probe->snapid, &c->size, &c->mtime, 
-		   probe->flags | CEPH_OSD_FLAG_RWORDERED, c);
     probe->ops.insert(p->oid);
+    stat_extents.push_back(*p);
+  }
+
+  probe->lock.Unlock();
+  for (std::vector<ObjectExtent>::iterator i = stat_extents.begin();
+      i != stat_extents.end(); ++i) {
+    C_Probe *c = new C_Probe(this, probe, i->oid);
+    objecter->stat(i->oid, i->oloc, probe->snapid, &c->size, &c->mtime,
+		   probe->flags | CEPH_OSD_FLAG_RWORDERED,
+		   new C_OnFinisher(c, finisher));
   }
 }
 
 /**
+ * probe->lock must be initially held, and will be released by this function.
+ *
  * @return true if probe is complete and Probe object may be freed.
  */
 bool Filer::_probed(Probe *probe, const object_t& oid, uint64_t size, utime_t mtime)
@@ -149,10 +160,13 @@ bool Filer::_probed(Probe *probe, const object_t& oid, uint64_t size, utime_t mt
   assert(probe->ops.count(oid));
   probe->ops.erase(oid);
 
-  if (!probe->ops.empty()) 
+  if (!probe->ops.empty()) {
+    probe->lock.Unlock();
     return false;  // waiting for more!
+  }
 
   if (probe->err) { // we hit an error, propagate back up
+    probe->lock.Unlock();
     return true;
   }
 
@@ -226,15 +240,15 @@ bool Filer::_probed(Probe *probe, const object_t& oid, uint64_t size, utime_t mt
       probe->probing_off -= period;
     }
     _probe(probe);
+    assert(!probe->lock.is_locked_by_me());
     return false;
-  }
-
-  if (probe->pmtime) {
+  } else if (probe->pmtime) {
     ldout(cct, 10) << "_probed found mtime " << probe->max_mtime << dendl;
     *probe->pmtime = probe->max_mtime;
   }
 
   // done!
+  probe->lock.Unlock();
   return true;
 }
 
@@ -242,6 +256,7 @@ bool Filer::_probed(Probe *probe, const object_t& oid, uint64_t size, utime_t mt
 // -----------------------
 
 struct PurgeRange {
+  Mutex lock;
   inodeno_t ino;
   ceph_file_layout layout;
   SnapContext snapc;
@@ -250,6 +265,11 @@ struct PurgeRange {
   int flags;
   Context *oncommit;
   int uncommitted;
+  PurgeRange(inodeno_t i, ceph_file_layout& l, const SnapContext& sc,
+	     uint64_t fo, uint64_t no, utime_t t, int fl, Context *fin) :
+	  lock("Filer::PurgeRange"), ino(i), layout(l), snapc(sc),
+	  first(fo), num(no), mtime(t), flags(fl), oncommit(fin),
+	  uncommitted(0) {}
 };
 
 int Filer::purge_range(inodeno_t ino,
@@ -272,17 +292,8 @@ int Filer::purge_range(inodeno_t ino,
     return 0;
   }
 
-  // lots!  let's do this in pieces.
-  PurgeRange *pr = new PurgeRange;
-  pr->ino = ino;
-  pr->layout = *layout;
-  pr->snapc = snapc;
-  pr->first = first_obj;
-  pr->num = num_obj;
-  pr->mtime = mtime;
-  pr->flags = flags;
-  pr->oncommit = oncommit;
-  pr->uncommitted = 0;
+  PurgeRange *pr = new PurgeRange(ino, *layout, snapc, first_obj,
+				  num_obj, mtime, flags, oncommit);
 
   _do_purge_range(pr, 0);
   return 0;
@@ -299,28 +310,39 @@ struct C_PurgeRange : public Context {
 
 void Filer::_do_purge_range(PurgeRange *pr, int fin)
 {
+  pr->lock.Lock();
   pr->uncommitted -= fin;
   ldout(cct, 10) << "_do_purge_range " << pr->ino << " objects " << pr->first << "~" << pr->num
 	   << " uncommitted " << pr->uncommitted << dendl;
 
   if (pr->num == 0 && pr->uncommitted == 0) {
     pr->oncommit->complete(0);
+    pr->lock.Unlock();
     delete pr;
     return;
   }
 
+  std::vector<object_t> remove_oids;
+
   int max = 10 - pr->uncommitted;
   while (pr->num > 0 && max > 0) {
-    object_t oid = file_object_t(pr->ino, pr->first);
-    const OSDMap *osdmap = objecter->get_osdmap_read();
-    object_locator_t oloc = osdmap->file_to_object_locator(pr->layout);
-    objecter->put_osdmap_read();
-    objecter->remove(oid, oloc, pr->snapc, pr->mtime, pr->flags,
-		     NULL, new C_PurgeRange(this, pr));
+    remove_oids.push_back(file_object_t(pr->ino, pr->first));
     pr->uncommitted++;
     pr->first++;
     pr->num--;
     max--;
+  }
+  pr->lock.Unlock();
+
+  // Issue objecter ops outside pr->lock to avoid lock dependency loop
+  for (std::vector<object_t>::iterator i = remove_oids.begin();
+      i != remove_oids.end(); ++i) {
+    const object_t oid = *i;
+    const OSDMap *osdmap = objecter->get_osdmap_read();
+    const object_locator_t oloc = osdmap->file_to_object_locator(pr->layout);
+    objecter->put_osdmap_read();
+    objecter->remove(oid, oloc, pr->snapc, pr->mtime, pr->flags, NULL,
+		     new C_OnFinisher(new C_PurgeRange(this, pr), finisher));
   }
 }
 

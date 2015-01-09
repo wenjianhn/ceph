@@ -30,6 +30,8 @@ namespace librados
   struct ObjListCtx;
   struct PoolAsyncCompletionImpl;
   class RadosClient;
+  class ListObjectImpl;
+  struct NObjectIteratorImpl;
 
   typedef void *list_ctx_t;
   typedef uint64_t auid_t;
@@ -63,7 +65,58 @@ namespace librados
   typedef void *completion_t;
   typedef void (*callback_t)(completion_t cb, void *arg);
 
-  class ObjectIterator : public std::iterator <std::forward_iterator_tag, std::string> {
+  class CEPH_RADOS_API ListObject
+  {
+  public:
+    const std::string& get_nspace() const;
+    const std::string& get_oid() const;
+    const std::string& get_locator() const;
+
+    ListObject();
+    ~ListObject();
+    ListObject( const ListObject&);
+    ListObject& operator=(const ListObject& rhs);
+  private:
+    ListObject(ListObjectImpl *impl);
+
+    friend class NObjectIteratorImpl;
+    friend std::ostream& operator<<(std::ostream& out, const ListObject& lop);
+
+    ListObjectImpl *impl;
+  };
+  CEPH_RADOS_API std::ostream& operator<<(std::ostream& out, const librados::ListObject& lop);
+
+  class CEPH_RADOS_API NObjectIterator : public std::iterator <std::forward_iterator_tag, ListObject> {
+  public:
+    static const NObjectIterator __EndObjectIterator;
+    NObjectIterator(): impl(NULL) {}
+    ~NObjectIterator();
+    NObjectIterator(const NObjectIterator &rhs);
+    NObjectIterator& operator=(const NObjectIterator& rhs);
+
+    bool operator==(const NObjectIterator& rhs) const;
+    bool operator!=(const NObjectIterator& rhs) const;
+    const ListObject& operator*() const;
+    const ListObject* operator->() const;
+    NObjectIterator &operator++(); // Preincrement
+    NObjectIterator operator++(int); // Postincrement
+    friend class IoCtx;
+    friend class NObjectIteratorImpl;
+
+    /// get current hash position of the iterator, rounded to the current pg
+    uint32_t get_pg_hash_position() const;
+
+    /// move the iterator to a given hash position.  this may (will!) be rounded to the nearest pg.
+    uint32_t seek(uint32_t pos);
+
+  private:
+    NObjectIterator(ObjListCtx *ctx_);
+    void get_next();
+    NObjectIteratorImpl *impl;
+  };
+
+  // DEPRECATED; Use NObjectIterator
+  class CEPH_RADOS_API ObjectIterator : public std::iterator <std::forward_iterator_tag, std::pair<std::string, std::string> > {
   public:
     static const ObjectIterator __EndObjectIterator;
     ObjectIterator() {}
@@ -92,13 +145,44 @@ namespace librados
     std::pair<std::string, std::string> cur_obj;
   };
 
-  class WatchCtx {
+  /// DEPRECATED; do not use
+  class CEPH_RADOS_API WatchCtx {
   public:
     virtual ~WatchCtx();
     virtual void notify(uint8_t opcode, uint64_t ver, bufferlist& bl) = 0;
   };
 
-  struct AioCompletion {
+  class CEPH_RADOS_API WatchCtx2 {
+  public:
+    virtual ~WatchCtx2();
+    /**
+     * Callback activated when we receive a notify event.
+     *
+     * @param notify_id unique id for this notify event
+     * @param cookie the watcher we are notifying
+     * @param notifier_id the unique client id of the notifier
+     * @param bl opaque notify payload (from the notifier)
+     */
+    virtual void handle_notify(uint64_t notify_id,
+			       uint64_t cookie,
+			       uint64_t notifier_id,
+			       bufferlist& bl) = 0;
+
+    /**
+     * Callback activated when we encounter an error with the watch.
+     *
+     * Errors we may see:
+     *   -ENOTCONN  : our watch was disconnected
+     *   -ETIMEDOUT : our watch is still valid, but we may have missed
+     *                a notify event.
+     *
+     * @param cookie the watcher with the problem
+     * @param err error
+     */
+    virtual void handle_error(uint64_t cookie, int err) = 0;
+  };
+
+  struct CEPH_RADOS_API AioCompletion {
     AioCompletion(AioCompletionImpl *pc_) : pc(pc_) {}
     int set_complete_callback(void *cb_arg, callback_t cb);
     int set_safe_callback(void *cb_arg, callback_t cb);
@@ -117,7 +201,7 @@ namespace librados
     AioCompletionImpl *pc;
   };
 
-  struct PoolAsyncCompletion {
+  struct CEPH_RADOS_API PoolAsyncCompletion {
     PoolAsyncCompletion(PoolAsyncCompletionImpl *pc_) : pc(pc_) {}
     int set_callback(void *cb_arg, callback_t cb);
     int wait();
@@ -134,9 +218,13 @@ namespace librados
   enum ObjectOperationFlags {
     OP_EXCL =   LIBRADOS_OP_FLAG_EXCL,
     OP_FAILOK = LIBRADOS_OP_FLAG_FAILOK,
+    OP_FADVISE_RANDOM = LIBRADOS_OP_FLAG_FADVISE_RANDOM,
+    OP_FADVISE_SEQUENTIAL = LIBRADOS_OP_FLAG_FADVISE_SEQUENTIAL,
+    OP_FADVISE_WILLNEED = LIBRADOS_OP_FLAG_FADVISE_WILLNEED,
+    OP_FADVISE_DONTNEED = LIBRADOS_OP_FLAG_FADVISE_DONTNEED,
   };
 
-  class ObjectOperationCompletion {
+  class CEPH_RADOS_API ObjectOperationCompletion {
   public:
     virtual ~ObjectOperationCompletion() {}
     virtual void handle_completion(int r, bufferlist& outbl) = 0;
@@ -177,14 +265,16 @@ namespace librados
    * Batch multiple object operations into a single request, to be applied
    * atomically.
    */
-  class ObjectOperation
+  class CEPH_RADOS_API ObjectOperation
   {
   public:
     ObjectOperation();
     virtual ~ObjectOperation();
 
     size_t size();
-    void set_op_flags(ObjectOperationFlags flags);
+    void set_op_flags(ObjectOperationFlags flags) __attribute__((deprecated));
+    //flag mean ObjectOperationFlags
+    void set_op_flags2(int flags);
 
     void cmpxattr(const char *name, uint8_t op, const bufferlist& val);
     void cmpxattr(const char *name, uint8_t op, uint64_t v);
@@ -242,7 +332,7 @@ namespace librados
    * Batch multiple object operations into a single request, to be applied
    * atomically.
    */
-  class ObjectWriteOperation : public ObjectOperation
+  class CEPH_RADOS_API ObjectWriteOperation : public ObjectOperation
   {
   protected:
     time_t *pmtime;
@@ -255,7 +345,9 @@ namespace librados
     }
 
     void create(bool exclusive);
-    void create(bool exclusive, const std::string& category);
+    void create(bool exclusive,
+		const std::string& category); ///< NOTE: category is unused
+
     void write(uint64_t off, const bufferlist& bl);
     void write_full(const bufferlist& bl);
     void append(const bufferlist& bl);
@@ -344,7 +436,7 @@ namespace librados
    * Batch multiple object operations into a single request, to be applied
    * atomically.
    */
-  class ObjectReadOperation : public ObjectOperation
+  class CEPH_RADOS_API ObjectReadOperation : public ObjectOperation
   {
   public:
     ObjectReadOperation() {}
@@ -498,8 +590,12 @@ namespace librados
    * rados.ioctx_create("my_pool", p);
    * p->stat(&stats);
    * ... etc ...
+   *
+   * NOTE: be sure to call watch_flush() prior to destroying any IoCtx
+   * that is used for watch events to ensure that racing callbacks
+   * have completed.
    */
-  class IoCtx
+  class CEPH_RADOS_API IoCtx
   {
   public:
     IoCtx();
@@ -531,7 +627,8 @@ namespace librados
 
     // create an object
     int create(const std::string& oid, bool exclusive);
-    int create(const std::string& oid, bool exclusive, const std::string& category);
+    int create(const std::string& oid, bool exclusive,
+	       const std::string& category); ///< category is unused
 
     /**
      * write bytes to an object at a specified offset
@@ -629,8 +726,10 @@ namespace librados
     int snap_list(std::vector<snap_t> *snaps);
 
     int snap_rollback(const std::string& oid, const char *snapname);
+
     // Deprecated name kept for backward compatibility - same as snap_rollback()
-    int rollback(const std::string& oid, const char *snapname);
+    int rollback(const std::string& oid, const char *snapname)
+      __attribute__ ((deprecated));
 
     int selfmanaged_snap_create(uint64_t *snapid);
 
@@ -662,11 +761,18 @@ namespace librados
 
 
     /// Start enumerating objects for a pool
-    ObjectIterator objects_begin();
+    NObjectIterator nobjects_begin();
     /// Start enumerating objects for a pool starting from a hash position
-    ObjectIterator objects_begin(uint32_t start_hash_position);
+    NObjectIterator nobjects_begin(uint32_t start_hash_position);
     /// Iterator indicating the end of a pool
-    const ObjectIterator& objects_end() const;
+    const NObjectIterator& nobjects_end() const;
+
+    // DEPRECATED
+    ObjectIterator objects_begin() __attribute__ ((deprecated));
+    /// Start enumerating objects for a pool starting from a hash position
+    ObjectIterator objects_begin(uint32_t start_hash_position) __attribute__ ((deprecated));
+    /// Iterator indicating the end of a pool
+    const ObjectIterator& objects_end() const __attribute__ ((deprecated));
 
     /**
      * List available hit set objects
@@ -828,13 +934,67 @@ namespace librados
 		    bufferlist *pbl);
 
     // watch/notify
-    int watch(const std::string& o, uint64_t ver, uint64_t *handle,
-	      librados::WatchCtx *ctx);
-    int unwatch(const std::string& o, uint64_t handle);
-    int notify(const std::string& o, uint64_t ver, bufferlist& bl);
+    int watch2(const std::string& o, uint64_t *handle,
+	       librados::WatchCtx2 *ctx);
+    int unwatch2(uint64_t handle);
+    /**
+     * Send a notify event ot watchers
+     *
+     * Upon completion the pbl bufferlist reply payload will be
+     * encoded like so:
+     *
+     *    le32 num_acks
+     *    {
+     *      le64 gid     global id for the client (for client.1234 that's 1234)
+     *      le64 cookie  cookie for the client
+     *      le32 buflen  length of reply message buffer
+     *      u8 * buflen  payload
+     *    } * num_acks
+     *    le32 num_timeouts
+     *    {
+     *      le64 gid     global id for the client
+     *      le64 cookie  cookie for the client
+     *    } * num_timeouts
+     *
+     *
+     */
+    int notify2(const std::string& o,   ///< object
+		bufferlist& bl,         ///< optional broadcast payload
+		uint64_t timeout_ms,    ///< timeout (in ms)
+		bufferlist *pbl);       ///< reply buffer
     int list_watchers(const std::string& o, std::list<obj_watch_t> *out_watchers);
     int list_snaps(const std::string& o, snap_set_t *out_snaps);
     void set_notify_timeout(uint32_t timeout);
+
+    /// acknowledge a notify we received.
+    void notify_ack(const std::string& o, ///< watched object
+		    uint64_t notify_id,   ///< notify id
+		    uint64_t cookie,      ///< our watch handle
+		    bufferlist& bl);      ///< optional reply payload
+
+    /***
+     * check on watch validity
+     *
+     * Check if a watch is valid.  If so, return the number of
+     * milliseconds since we last confirmed its liveness.  If there is
+     * a known error, return it.
+     *
+     * If there is an error, the watch is no longer valid, and should
+     * be destroyed with unwatch().  The the user is still interested
+     * in the object, a new watch should be created with watch().
+     *
+     * @param cookie watch handle
+     * @returns ms since last confirmed valid, or error
+     */
+    int watch_check(uint64_t cookie);
+
+    // old, deprecated versions
+    int watch(const std::string& o, uint64_t ver, uint64_t *cookie,
+	      librados::WatchCtx *ctx) __attribute__ ((deprecated));
+    int notify(const std::string& o, uint64_t ver, bufferlist& bl)
+      __attribute__ ((deprecated));
+    int unwatch(const std::string& o, uint64_t cookie)
+      __attribute__ ((deprecated));
 
     /**
      * Set allocation hint for an object
@@ -879,7 +1039,7 @@ namespace librados
     IoCtxImpl *io_ctx_impl;
   };
 
-  class Rados
+  class CEPH_RADOS_API Rados
   {
   public:
     static void version(int *major, int *minor, int *extra);
@@ -895,6 +1055,7 @@ namespace librados
     config_t cct();
     int connect();
     void shutdown();
+    int watch_flush();
     int conf_read_file(const char * const path) const;
     int conf_parse_argv(int argc, const char ** argv) const;
     int conf_parse_argv_remainder(int argc, const char ** argv,
@@ -909,6 +1070,7 @@ namespace librados
     int pool_create_async(const char *name, PoolAsyncCompletion *c);
     int pool_create_async(const char *name, uint64_t auid, PoolAsyncCompletion *c);
     int pool_create_async(const char *name, uint64_t auid, uint8_t crush_rule, PoolAsyncCompletion *c);
+    int pool_get_base_tier(int64_t pool, int64_t* base_tier);
     int pool_delete(const char *name);
     int pool_delete_async(const char *name, PoolAsyncCompletion *c);
     int64_t pool_lookup(const char *name);
@@ -927,7 +1089,11 @@ namespace librados
     /* listing objects */
     int pool_list(std::list<std::string>& v);
     int get_pool_stats(std::list<std::string>& v,
+		       stats_map& result);
+    /// deprecated; use simpler form.  categories no longer supported.
+    int get_pool_stats(std::list<std::string>& v,
 		       std::map<std::string, stats_map>& stats);
+    /// deprecated; categories no longer supported
     int get_pool_stats(std::list<std::string>& v,
                        std::string& category,
 		       std::map<std::string, stats_map>& stats);

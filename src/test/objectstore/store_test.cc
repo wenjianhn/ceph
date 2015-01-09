@@ -217,6 +217,103 @@ TEST_P(StoreTest, SimpleObjectTest) {
   }
 }
 
+TEST_P(StoreTest, SimpleCloneTest) {
+  int r;
+  coll_t cid = coll_t("coll");
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid);
+    cerr << "Creating collection " << cid << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  bufferlist small;
+  small.append("small");
+  {
+    ObjectStore::Transaction t;
+    t.touch(cid, hoid);
+    t.setattr(cid, hoid, "attr1", small);
+    cerr << "Creating object and set attr " << hoid << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  ghobject_t hoid2(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+  {
+    ObjectStore::Transaction t;
+    t.clone(cid, hoid, hoid2);
+    t.rmattr(cid, hoid, "attr1");
+    cerr << "Clone object and rm attr" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove(cid, hoid2);
+    t.remove_collection(cid);
+    cerr << "Cleaning" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+}
+
+TEST_P(StoreTest, SimpleCloneRangeTest) {
+  int r;
+  coll_t cid = coll_t("coll");
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid);
+    cerr << "Creating collection " << cid << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  bufferlist small, newdata;
+  small.append("small");
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, 10, 5, small);
+    cerr << "Creating object and write bl " << hoid << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  ghobject_t hoid2(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+  {
+    ObjectStore::Transaction t;
+    t.clone_range(cid, hoid, hoid2, 10, 5, 0);
+    cerr << "Clone range object" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+    r = store->read(cid, hoid2, 0, 5, newdata);
+    ASSERT_EQ(r, 5);
+    ASSERT_TRUE(newdata.contents_equal(small));
+  }
+  {
+    ObjectStore::Transaction t;
+    t.truncate(cid, hoid, 1024*1024);
+    t.clone_range(cid, hoid, hoid2, 0, 1024*1024, 0);
+    cerr << "Clone range object" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+    struct stat stat, stat2;
+    r = store->stat(cid, hoid, &stat);
+    r = store->stat(cid, hoid2, &stat2);
+    ASSERT_EQ(stat.st_size, stat2.st_size);
+    ASSERT_EQ(1024*1024, stat2.st_size);
+  }
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove(cid, hoid2);
+    t.remove_collection(cid);
+    cerr << "Cleaning" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+}
+
+
 TEST_P(StoreTest, SimpleObjectLongnameTest) {
   int r;
   coll_t cid = coll_t("coll");
@@ -571,8 +668,7 @@ public:
     boost::uniform_int<> u2(4, max_attr_value_len);
     boost::uniform_int<> u3(0, 100);
     uint64_t size = u0(*rng);
-    uint64_t name_len, value_len;
-    uint64_t get_exist;
+    uint64_t name_len;
     map<string, bufferlist> attrs;
     set<string> keys;
     for (map<string, bufferlist>::iterator it = contents[obj].attrs.begin();
@@ -581,8 +677,8 @@ public:
 
     while (size--) {
       bufferlist name, value;
-      get_exist = u3(*rng);
-      value_len = u2(*rng);
+      uint64_t get_exist = u3(*rng);
+      uint64_t value_len = u2(*rng);
       filled_byte_array(value, value_len);
       if (get_exist < 50 && keys.size()) {
         set<string>::iterator k = keys.begin();
@@ -1020,13 +1116,14 @@ TEST_P(StoreTest, HashCollisionTest) {
        i != created.end();
        ++i) {
     ObjectStore::Transaction t;
-    t.collection_remove(cid, *i);
+    t.remove(cid, *i);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
   }
   ObjectStore::Transaction t;
   t.remove_collection(cid);
-  store->apply_transaction(t);
+  r = store->apply_transaction(t);
+  ASSERT_EQ(r, 0);
 }
 
 TEST_P(StoreTest, ScrubTest) {
@@ -1055,6 +1152,23 @@ TEST_P(StoreTest, ScrubTest) {
     }
     created.insert(hoid);
   }
+
+  // Add same hobject_t but different generation or shard_id
+  {
+    ghobject_t hoid1(hobject_t("same-object", string(), CEPH_NOSNAP, 0, 0, ""));
+    ghobject_t hoid2(hobject_t("same-object", string(), CEPH_NOSNAP, 0, 0, ""), (gen_t)1, (shard_id_t)0);
+    ghobject_t hoid3(hobject_t("same-object", string(), CEPH_NOSNAP, 0, 0, ""), (gen_t)2, (shard_id_t)0);
+    ObjectStore::Transaction t;
+    t.touch(cid, hoid1);
+    t.touch(cid, hoid2);
+    t.touch(cid, hoid3);
+    r = store->apply_transaction(t);
+    created.insert(hoid1);
+    created.insert(hoid2);
+    created.insert(hoid3);
+    ASSERT_EQ(r, 0);
+  }
+
   vector<ghobject_t> objects;
   r = store->collection_list(cid, objects);
   ASSERT_EQ(r, 0);
@@ -1094,13 +1208,14 @@ TEST_P(StoreTest, ScrubTest) {
        i != created.end();
        ++i) {
     ObjectStore::Transaction t;
-    t.collection_remove(cid, *i);
+    t.remove(cid, *i);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
   }
   ObjectStore::Transaction t;
   t.remove_collection(cid);
-  store->apply_transaction(t);
+  r = store->apply_transaction(t);
+  ASSERT_EQ(r, 0);
 }
 
 
@@ -1219,7 +1334,8 @@ TEST_P(StoreTest, OMapTest) {
   ObjectStore::Transaction t;
   t.remove(cid, hoid);
   t.remove_collection(cid);
-  store->apply_transaction(t);
+  r = store->apply_transaction(t);
+  ASSERT_EQ(r, 0);
 }
 
 TEST_P(StoreTest, XattrTest) {
@@ -1300,6 +1416,12 @@ TEST_P(StoreTest, XattrTest) {
   bufferlist bl2;
   bl2.push_back(bp);
   ASSERT_TRUE(bl2 == attrs["attr3"]);
+
+  ObjectStore::Transaction t;
+  t.remove(cid, hoid);
+  t.remove_collection(cid);
+  r = store->apply_transaction(t);
+  ASSERT_EQ(r, 0);
 }
 
 void colsplittest(
@@ -1347,7 +1469,7 @@ void colsplittest(
   for (vector<ghobject_t>::iterator i = objects.begin();
        i != objects.end();
        ++i) {
-    ASSERT_EQ(!(i->hobj.hash & (1<<common_suffix_size)), 0u);
+    ASSERT_EQ(!(i->hobj.get_hash() & (1<<common_suffix_size)), 0u);
     t.remove(cid, *i);
   }
 
@@ -1358,7 +1480,7 @@ void colsplittest(
   for (vector<ghobject_t>::iterator i = objects.begin();
        i != objects.end();
        ++i) {
-    ASSERT_EQ(i->hobj.hash & (1<<common_suffix_size), 0u);
+    ASSERT_EQ(i->hobj.get_hash() & (1<<common_suffix_size), 0u);
     t.remove(tid, *i);
   }
 
@@ -1402,10 +1524,10 @@ TEST_P(StoreTest, TwoHash) {
     ObjectStore::Transaction t;
     ghobject_t o;
     if (i < 8) {
-      o.hobj.hash = (i << 16) | 0xA1;
+      o.hobj.set_hash((i << 16) | 0xA1);
       t.touch(cid, o);
     }
-    o.hobj.hash = (i << 16) | 0xB1;
+    o.hobj.set_hash((i << 16) | 0xB1);
     t.touch(cid, o);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
@@ -1414,7 +1536,7 @@ TEST_P(StoreTest, TwoHash) {
   for (int i = 1; i < 8; ++i) {
     ObjectStore::Transaction t;
     ghobject_t o;
-    o.hobj.hash = (i << 16) | 0xA1;
+    o.hobj.set_hash((i << 16) | 0xA1);
     t.remove(cid, o);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
@@ -1423,13 +1545,13 @@ TEST_P(StoreTest, TwoHash) {
   for (int i = 1; i < 8; ++i) {
     ObjectStore::Transaction t;
     ghobject_t o;
-    o.hobj.hash = (i << 16) | 0xA1;
+    o.hobj.set_hash((i << 16) | 0xA1);
     bool exists = store->exists(cid, o);
     ASSERT_EQ(exists, false);
   }
   {
     ghobject_t o;
-    o.hobj.hash = 0xA1;
+    o.hobj.set_hash(0xA1);
     bool exists = store->exists(cid, o);
     ASSERT_EQ(exists, true);
   }
@@ -1437,9 +1559,9 @@ TEST_P(StoreTest, TwoHash) {
   for (int i = 0; i < 360; ++i) {
     ObjectStore::Transaction t;
     ghobject_t o;
-    o.hobj.hash = (i << 16) | 0xA1;
+    o.hobj.set_hash((i << 16) | 0xA1);
     t.remove(cid, o);
-    o.hobj.hash = (i << 16) | 0xB1;
+    o.hobj.set_hash((i << 16) | 0xB1);
     t.remove(cid, o);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
@@ -1699,6 +1821,8 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf->set_val("filestore_index_retry_probability", "0.5");
   g_ceph_context->_conf->set_val("filestore_op_thread_timeout", "1000");
   g_ceph_context->_conf->set_val("filestore_op_thread_suicide_timeout", "10000");
+  g_ceph_context->_conf->set_val("filestore_debug_disable_sharded_check", "true");
+  g_ceph_context->_conf->set_val("filestore_fiemap", "true");
   g_ceph_context->_conf->apply_changes(NULL);
 
   ::testing::InitGoogleTest(&argc, argv);

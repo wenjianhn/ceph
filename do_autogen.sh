@@ -15,9 +15,10 @@ do_autogen.sh: make a ceph build by running autogen, etc.
 -P                               profiling build
 -p                               google profiler
 -O <level>                       optimize
--n                               use libnss
+-c                               use cryptopp
 -j                               with java
 -r                               with rocksdb
+-J				 --with-jemalloc
 
 EOF
 }
@@ -31,14 +32,14 @@ debug_level=0
 verbose=0
 profile=0
 CONFIGURE_FLAGS="--disable-static"
-while getopts  "d:e:hHrTPjpnvO:" flag
+while getopts  "d:e:hHrTPJjpcvO:" flag
 do
     case $flag in
     d) debug_level=$OPTARG;;
 
     O) CFLAGS="${CFLAGS} -O$OPTARG";;
 
-    n) CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-nss --without-cryptopp";;
+    c) CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-cryptopp --without-nss";;
 
     P) profile=1;;
     p) with_profiler="--with-profiler" ;;
@@ -55,6 +56,8 @@ do
     v) verbose=1;;
 
     e) encode_dump=$OPTARG;;
+
+    J) CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-jemalloc";;
 
     *)
         echo
@@ -126,6 +129,6 @@ export CXXFLAGS
 
 ./configure \
 --prefix=/usr --sbindir=/sbin --localstatedir=/var --sysconfdir=/etc \
---with-debug $with_profiler --with-cryptopp --with-radosgw \
+--with-debug $with_profiler --with-nss --with-radosgw \
 $CONFIGURE_FLAGS \
 || die "configure failed"

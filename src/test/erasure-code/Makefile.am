@@ -1,13 +1,27 @@
 check_SCRIPTS += \
 	test/erasure-code/test-erasure-code.sh
 
+noinst_HEADERS += \
+	test/erasure-code/ceph_erasure_code_benchmark.h
 ceph_erasure_code_benchmark_SOURCES = \
+	erasure-code/ErasureCode.cc \
 	test/erasure-code/ceph_erasure_code_benchmark.cc
 ceph_erasure_code_benchmark_LDADD = $(LIBOSD) $(LIBCOMMON) $(BOOST_PROGRAM_OPTIONS_LIBS) $(CEPH_GLOBAL)
 if LINUX
 ceph_erasure_code_benchmark_LDADD += -ldl
 endif
 bin_DEBUGPROGRAMS += ceph_erasure_code_benchmark
+
+noinst_HEADERS += \
+	test/erasure-code/ceph_erasure_code_benchmark.h
+
+ceph_erasure_code_non_regression_SOURCES = \
+	test/erasure-code/ceph_erasure_code_non_regression.cc
+ceph_erasure_code_non_regression_LDADD = $(LIBOSD) $(LIBCOMMON) $(BOOST_PROGRAM_OPTIONS_LIBS) $(CEPH_GLOBAL)
+if LINUX
+ceph_erasure_code_non_regression_LDADD += -ldl
+endif
+noinst_PROGRAMS += ceph_erasure_code_non_regression
 
 ceph_erasure_code_SOURCES = \
 	test/erasure-code/ceph_erasure_code.cc
@@ -64,6 +78,14 @@ libec_fail_to_register_la_LIBADD = $(PTHREAD_LIBS) $(EXTRALIBS)
 libec_fail_to_register_la_LDFLAGS = ${AM_LDFLAGS} -export-symbols-regex '.*__erasure_code_.*'
 erasure_codelib_LTLIBRARIES += libec_fail_to_register.la
 
+libec_test_jerasure_neon_la_SOURCES = test/erasure-code/TestJerasurePluginNEON.cc
+test/erasure-code/TestJerasurePluginNEON.cc: ./ceph_ver.h
+libec_test_jerasure_neon_la_CFLAGS = ${AM_CFLAGS}
+libec_test_jerasure_neon_la_CXXFLAGS= ${AM_CXXFLAGS}
+libec_test_jerasure_neon_la_LIBADD = $(PTHREAD_LIBS) $(EXTRALIBS)
+libec_test_jerasure_neon_la_LDFLAGS = ${AM_LDFLAGS} -export-symbols-regex '.*__erasure_code_.*'
+erasure_codelib_LTLIBRARIES += libec_test_jerasure_neon.la
+
 libec_test_jerasure_sse4_la_SOURCES = test/erasure-code/TestJerasurePluginSSE4.cc
 test/erasure-code/TestJerasurePluginSSE4.cc: ./ceph_ver.h
 libec_test_jerasure_sse4_la_CFLAGS = ${AM_CFLAGS}
@@ -97,6 +119,13 @@ if LINUX
 unittest_erasure_code_plugin_LDADD += -ldl
 endif
 check_PROGRAMS += unittest_erasure_code_plugin
+
+unittest_erasure_code_SOURCES = \
+	erasure-code/ErasureCode.cc \
+	test/erasure-code/TestErasureCode.cc
+unittest_erasure_code_CXXFLAGS = $(UNITTEST_CXXFLAGS)
+unittest_erasure_code_LDADD = $(LIBOSD) $(LIBCOMMON) $(UNITTEST_LDADD) $(CEPH_GLOBAL)
+check_PROGRAMS += unittest_erasure_code
 
 unittest_erasure_code_jerasure_SOURCES = \
 	test/erasure-code/TestErasureCodeJerasure.cc \
@@ -170,6 +199,3 @@ noinst_HEADERS += test/erasure-code/ErasureCodeExample.h
 unittest_erasure_code_example_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 unittest_erasure_code_example_LDADD = $(LIBOSD) $(LIBCOMMON) $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 check_PROGRAMS += unittest_erasure_code_example
-
-noinst_HEADERS += \
-	test/erasure-code/ceph_erasure_code_benchmark.h

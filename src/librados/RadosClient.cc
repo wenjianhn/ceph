@@ -28,9 +28,8 @@
 #include "include/buffer.h"
 #include "include/stringify.h"
 
-#include "messages/MWatchNotify.h"
 #include "messages/MLog.h"
-#include "msg/SimpleMessenger.h"
+#include "msg/Messenger.h"
 
 // needed for static_cast
 #include "messages/PaxosServiceMessage.h"
@@ -78,8 +77,7 @@ librados::RadosClient::RadosClient(CephContext *cct_)
     timer(cct, lock),
     refcnt(1),
     log_last_version(0), log_cb(NULL), log_cb_arg(NULL),
-    finisher(cct),
-    max_watch_notify_cookie(0)
+    finisher(cct)
 {
 }
 
@@ -209,7 +207,8 @@ int librados::RadosClient::connect()
 
   err = -ENOMEM;
   nonce = getpid() + (1000000 * (uint64_t)rados_instance.inc());
-  messenger = new SimpleMessenger(cct, entity_name_t::CLIENT(-1), "radosclient", nonce);
+  messenger = Messenger::create(cct, cct->_conf->ms_type, entity_name_t::CLIENT(-1),
+				"radosclient", nonce);
   if (!messenger)
     goto out;
 
@@ -224,6 +223,7 @@ int librados::RadosClient::connect()
 
   err = -ENOMEM;
   objecter = new Objecter(cct, messenger, &monclient,
+			  &finisher,
 			  cct->_conf->rados_mon_op_timeout,
 			  cct->_conf->rados_osd_op_timeout);
   if (!objecter)
@@ -298,14 +298,25 @@ void librados::RadosClient::shutdown()
   instance_id = 0;
   timer.shutdown();   // will drop+retake lock
   lock.Unlock();
-  if (need_objecter)
+  if (need_objecter) {
+    // make sure watch callbacks are flushed
+    watch_flush();
     objecter->shutdown();
+  }
   monclient.shutdown();
   if (messenger) {
     messenger->shutdown();
     messenger->wait();
   }
   ldout(cct, 1) << "shutdown" << dendl;
+}
+
+int librados::RadosClient::watch_flush()
+{
+  ldout(cct, 10) << __func__ << " enter" << dendl;
+  objecter->linger_callback_flush();
+  ldout(cct, 10) << __func__ << " exit" << dendl;
+  return 0;
 }
 
 uint64_t librados::RadosClient::get_instance_id()
@@ -338,8 +349,7 @@ int librados::RadosClient::create_ioctx(const char *name, IoCtxImpl **io)
     }
   }
 
-  *io = new librados::IoCtxImpl(this, objecter, &lock, poolid, name,
-				CEPH_NOSNAP);
+  *io = new librados::IoCtxImpl(this, objecter, poolid, name, CEPH_NOSNAP);
   return 0;
 }
 
@@ -383,10 +393,6 @@ bool librados::RadosClient::_dispatch(Message *m)
     break;
 
   case CEPH_MSG_MDS_MAP:
-    break;
-
-  case CEPH_MSG_WATCH_NOTIFY:
-    handle_watch_notify(static_cast<MWatchNotify *>(m));
     break;
 
   case MSG_LOG:
@@ -569,6 +575,31 @@ int librados::RadosClient::pool_create_async(string& name, PoolAsyncCompletionIm
   return r;
 }
 
+int librados::RadosClient::pool_get_base_tier(int64_t pool_id, int64_t* base_tier)
+{
+  int r = wait_for_osdmap();
+  if (r < 0) {
+    return r;
+  }
+
+  const OSDMap *osdmap = objecter->get_osdmap_read();
+
+  const pg_pool_t* pool = osdmap->get_pg_pool(pool_id);
+  if (pool) {
+    if (pool->tier_of < 0) {
+      *base_tier = pool_id;
+    } else {
+      *base_tier = pool->tier_of;
+    }
+    r = 0;
+  } else {
+    r = -ENOENT;
+  }
+
+  objecter->put_osdmap_read();
+  return r;
+}
+
 int librados::RadosClient::pool_delete(const char *name)
 {
   int r = wait_for_osdmap();
@@ -612,104 +643,6 @@ void librados::RadosClient::blacklist_self(bool set) {
   Mutex::Locker l(lock);
   objecter->blacklist_self(set);
 }
-
-
-// -----------
-// watch/notify
-
-void librados::RadosClient::register_watch_notify_callback(
-  WatchNotifyInfo *wc,
-  uint64_t *cookie)
-{
-  assert(lock.is_locked_by_me());
-  wc->cookie = *cookie = ++max_watch_notify_cookie;
-  ldout(cct,10) << __func__ << " cookie " << wc->cookie << dendl;
-  watch_notify_info[wc->cookie] = wc;
-}
-
-void librados::RadosClient::unregister_watch_notify_callback(uint64_t cookie)
-{
-  ldout(cct,10) << __func__ << " cookie " << cookie << dendl;
-  assert(lock.is_locked_by_me());
-  map<uint64_t, WatchNotifyInfo *>::iterator iter =
-    watch_notify_info.find(cookie);
-  if (iter != watch_notify_info.end()) {
-    WatchNotifyInfo *ctx = iter->second;
-    if (ctx->linger_id)
-      objecter->unregister_linger(ctx->linger_id);
-
-    watch_notify_info.erase(iter);
-    lock.Unlock();
-    ldout(cct, 10) << __func__ << " dropping reference, waiting ctx="
-		   << (void *)ctx << dendl;
-    ctx->put_wait();
-    ldout(cct, 10) << __func__ << " done ctx=" << (void *)ctx << dendl;
-    lock.Lock();
-  }
-}
-
-struct C_DoWatchNotify : public Context {
-  librados::RadosClient *rados;
-  MWatchNotify *m;
-  C_DoWatchNotify(librados::RadosClient *r, MWatchNotify *m) : rados(r), m(m) {}
-  void finish(int r) {
-    rados->do_watch_notify(m);
-  }
-};
-
-void librados::RadosClient::handle_watch_notify(MWatchNotify *m)
-{
-  Mutex::Locker l(lock);
-
-  if (watch_notify_info.count(m->cookie)) {
-    ldout(cct,10) << __func__ << " queueing async " << *m << dendl;
-    // deliver this async via a finisher thread
-    finisher.queue(new C_DoWatchNotify(this, m));
-  } else {
-    // drop it on the floor
-    ldout(cct,10) << __func__ << " cookie " << m->cookie << " unknown" << dendl;
-    m->put();
-  }
-}
-
-void librados::RadosClient::do_watch_notify(MWatchNotify *m)
-{
-  Mutex::Locker l(lock);
-  map<uint64_t, WatchNotifyInfo *>::iterator iter =
-    watch_notify_info.find(m->cookie);
-  if (iter != watch_notify_info.end()) {
-    WatchNotifyInfo *wc = iter->second;
-    assert(wc);
-    if (wc->notify_lock) {
-      // we sent a notify and it completed (or failed)
-      ldout(cct,10) << __func__ << " completed notify " << *m << dendl;
-      wc->notify_lock->Lock();
-      *wc->notify_done = true;
-      *wc->notify_rval = m->return_code;
-      wc->notify_cond->Signal();
-      wc->notify_lock->Unlock();
-    } else {
-      // we are watcher and got a notify
-      ldout(cct,10) << __func__ << " got notify " << *m << dendl;
-      wc->get();
-
-      // trigger the callback
-      lock.Unlock();
-      wc->watch_ctx->notify(m->opcode, m->ver, m->bl);
-      lock.Lock();
-
-      // send ACK back to the OSD
-      wc->io_ctx_impl->_notify_ack(wc->oid, m->notify_id, m->ver, m->cookie);
-
-      ldout(cct,10) << __func__ << " notify done" << dendl;
-      wc->put();
-    }
-  } else {
-    ldout(cct, 4) << __func__ << " unknown cookie " << m->cookie << dendl;
-  }
-  m->put();
-}
-
 
 int librados::RadosClient::mon_command(const vector<string>& cmd,
 				       const bufferlist &inbl,

@@ -1,9 +1,12 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 /*
  * Ceph - scalable distributed file system
  *
  * Copyright (C) 2014 CERN (Switzerland)
+ * Copyright (C) 2014 Red Hat <contact@redhat.com>
  *
  * Author: Andreas-Joachim Peters <Andreas.Joachim.Peters@cern.ch>
+ * Author: Loic Dachary <loic@dachary.org>
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -18,55 +21,53 @@
 #include "include/stringify.h"
 #include "global/global_init.h"
 #include "erasure-code/isa/ErasureCodeIsa.h"
+#include "erasure-code/isa/xor_op.h"
 #include "common/ceph_argparse.h"
 #include "global/global_context.h"
 #include "gtest/gtest.h"
 
 ErasureCodeIsaTableCache tcache;
 
-
-template <typename T>
 class IsaErasureCodeTest : public ::testing::Test {
 public:
+  void compare_chunks(bufferlist &in, map<int, bufferlist> &encoded);
+  void encode_decode(unsigned object_size); 
 };
 
-typedef ::testing::Types<
-ErasureCodeIsaDefault
-> IsaTypes;
-TYPED_TEST_CASE(IsaErasureCodeTest, IsaTypes);
-
-TYPED_TEST(IsaErasureCodeTest, encode_decode)
+void IsaErasureCodeTest::compare_chunks(bufferlist &in, map<int, bufferlist> &encoded)
 {
-  TypeParam Isa(tcache);
+  unsigned object_size = in.length();
+  unsigned chunk_size = encoded[0].length();
+  for (unsigned i = 0; i < encoded.size(); i++) {
+    if (i * chunk_size >= object_size)
+      break;
+    int chunk_length = object_size > (i + 1) * chunk_size ? chunk_size : object_size - i * chunk_size;
+    EXPECT_EQ(0, memcmp(encoded[i].c_str(), in.c_str() + i * chunk_size, chunk_length));
+  }
+}
+
+void IsaErasureCodeTest::encode_decode(unsigned object_size)
+{
+  ErasureCodeIsaDefault Isa(tcache);
+
   map<std::string, std::string> parameters;
   parameters["k"] = "2";
   parameters["m"] = "2";
   Isa.init(parameters);
 
-#define LARGE_ENOUGH 2048
-  bufferptr in_ptr(buffer::create_page_aligned(LARGE_ENOUGH));
-  in_ptr.zero();
-  in_ptr.set_length(0);
-  const char *payload =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  in_ptr.append(payload, strlen(payload));
+  string payload(object_size, 'X');
   bufferlist in;
-  in.push_front(in_ptr);
+  // may be multiple bufferptr if object_size is larger than CEPH_PAGE_SIZE
+  in.append(payload.c_str(), payload.length());
   int want_to_encode[] = {0, 1, 2, 3};
   map<int, bufferlist> encoded;
   EXPECT_EQ(0, Isa.encode(set<int>(want_to_encode, want_to_encode + 4),
                           in,
                           &encoded));
   EXPECT_EQ(4u, encoded.size());
-  unsigned length = encoded[0].length();
-  EXPECT_EQ(0, strncmp(encoded[0].c_str(), in.c_str(), length));
-  EXPECT_EQ(0, strncmp(encoded[1].c_str(), in.c_str() + length,
-                       in.length() - length));
-
+  unsigned chunk_size = encoded[0].length();
+  EXPECT_EQ(chunk_size, Isa.get_chunk_size(object_size));
+  compare_chunks(in, encoded);
 
   // all chunks are available
   {
@@ -76,20 +77,15 @@ TYPED_TEST(IsaErasureCodeTest, encode_decode)
                             encoded,
                             &decoded));
     EXPECT_EQ(2u, decoded.size());
-    EXPECT_EQ(length, decoded[0].length());
-    EXPECT_EQ(0, strncmp(decoded[0].c_str(), in.c_str(), length));
-    EXPECT_EQ(0, strncmp(decoded[1].c_str(), in.c_str() + length,
-                         in.length() - length));
+    EXPECT_EQ(chunk_size, decoded[0].length());
+    compare_chunks(in, decoded);
   }
 
   // one data chunk is missing
   {
     map<int, bufferlist> degraded = encoded;
 
-    buffer::ptr enc1(buffer::create_page_aligned(LARGE_ENOUGH));
-    enc1.zero();
-    enc1.set_length(0);
-    enc1.append(encoded[1].c_str(), length);
+    string enc1(encoded[1].c_str(), chunk_size);
 
     degraded.erase(1);
     EXPECT_EQ(3u, degraded.size());
@@ -100,18 +96,15 @@ TYPED_TEST(IsaErasureCodeTest, encode_decode)
                             &decoded));
     // always decode all, regardless of want_to_decode
     EXPECT_EQ(4u, decoded.size());
-    EXPECT_EQ(length, decoded[1].length());
-    EXPECT_EQ(0, strncmp(decoded[1].c_str(), enc1.c_str(), length));
+    EXPECT_EQ(chunk_size, decoded[1].length());
+    EXPECT_EQ(0, memcmp(decoded[1].c_str(), enc1.c_str(), chunk_size));
   }
 
   // non-xor coding chunk is missing
   {
     map<int, bufferlist> degraded = encoded;
 
-    buffer::ptr enc3(buffer::create_page_aligned(LARGE_ENOUGH));
-    enc3.zero();
-    enc3.set_length(0);
-    enc3.append(encoded[3].c_str(), length);
+    string enc3(encoded[3].c_str(), chunk_size);
 
     degraded.erase(3);
     EXPECT_EQ(3u, degraded.size());
@@ -122,18 +115,15 @@ TYPED_TEST(IsaErasureCodeTest, encode_decode)
                             &decoded));
     // always decode all, regardless of want_to_decode
     EXPECT_EQ(4u, decoded.size());
-    EXPECT_EQ(length, decoded[3].length());
-    EXPECT_EQ(0, strncmp(decoded[3].c_str(), enc3.c_str(), length));
+    EXPECT_EQ(chunk_size, decoded[3].length());
+    EXPECT_EQ(0, memcmp(decoded[3].c_str(), enc3.c_str(), chunk_size));
   }
 
   // xor coding chunk is missing
   {
     map<int, bufferlist> degraded = encoded;
 
-    buffer::ptr enc2(buffer::create_page_aligned(LARGE_ENOUGH));
-    enc2.zero();
-    enc2.set_length(0);
-    enc2.append(encoded[2].c_str(), length);
+    string enc2(encoded[2].c_str(), chunk_size);
 
     degraded.erase(2);
     EXPECT_EQ(3u, degraded.size());
@@ -144,18 +134,15 @@ TYPED_TEST(IsaErasureCodeTest, encode_decode)
                             &decoded));
     // always decode all, regardless of want_to_decode
     EXPECT_EQ(4u, decoded.size());
-    EXPECT_EQ(length, decoded[2].length());
-    EXPECT_EQ(0, strncmp(decoded[2].c_str(), enc2.c_str(), length));
+    EXPECT_EQ(chunk_size, decoded[2].length());
+    EXPECT_EQ(0, memcmp(decoded[2].c_str(), enc2.c_str(), chunk_size));
   }
 
   // one data and one coding chunk is missing
   {
     map<int, bufferlist> degraded = encoded;
 
-    buffer::ptr enc3(buffer::create_page_aligned(LARGE_ENOUGH));
-    enc3.zero();
-    enc3.set_length(0);
-    enc3.append(encoded[3].c_str(), length);
+    string enc3(encoded[3].c_str(), chunk_size);
 
     degraded.erase(1);
     degraded.erase(3);
@@ -167,8 +154,8 @@ TYPED_TEST(IsaErasureCodeTest, encode_decode)
                             &decoded));
     // always decode all, regardless of want_to_decode
     EXPECT_EQ(4u, decoded.size());
-    EXPECT_EQ(length, decoded[1].length());
-    EXPECT_EQ(0, strncmp(decoded[3].c_str(), enc3.c_str(), length));
+    EXPECT_EQ(chunk_size, decoded[1].length());
+    EXPECT_EQ(0, memcmp(decoded[3].c_str(), enc3.c_str(), chunk_size));
   }
 
   // two data chunks are missing
@@ -184,16 +171,25 @@ TYPED_TEST(IsaErasureCodeTest, encode_decode)
                             &decoded));
     // always decode all, regardless of want_to_decode
     EXPECT_EQ(4u, decoded.size());
-    EXPECT_EQ(length, decoded[0].length());
-    EXPECT_EQ(0, strncmp(decoded[0].c_str(), in.c_str(), length));
-    EXPECT_EQ(0, strncmp(decoded[1].c_str(), in.c_str() + length,
-                         in.length() - length));
+    EXPECT_EQ(chunk_size, decoded[0].length());
+    compare_chunks(in, decoded);
   }
+
 }
 
-TYPED_TEST(IsaErasureCodeTest, minimum_to_decode)
+TEST_F(IsaErasureCodeTest, encode_decode)
 {
-  TypeParam Isa(tcache);
+  encode_decode(1);
+  encode_decode(EC_ISA_ADDRESS_ALIGNMENT);
+  encode_decode(EC_ISA_ADDRESS_ALIGNMENT + 1);
+  encode_decode(2048);
+  encode_decode(4096);
+  encode_decode(4096 + 1);
+}
+
+TEST_F(IsaErasureCodeTest, minimum_to_decode)
+{
+  ErasureCodeIsaDefault Isa(tcache);
   map<std::string, std::string> parameters;
   parameters["k"] = "2";
   parameters["m"] = "2";
@@ -287,7 +283,41 @@ TYPED_TEST(IsaErasureCodeTest, minimum_to_decode)
   }
 }
 
-TEST(IsaErasureCodeTest, encode)
+TEST_F(IsaErasureCodeTest, chunk_size)
+{
+  {
+    ErasureCodeIsaDefault Isa(tcache);
+    map<std::string, std::string> parameters;
+    parameters["k"] = "2";
+    parameters["m"] = "1";
+    Isa.init(parameters);
+    int k = 2;
+
+    ASSERT_EQ(EC_ISA_ADDRESS_ALIGNMENT, Isa.get_chunk_size(1));
+    ASSERT_EQ(EC_ISA_ADDRESS_ALIGNMENT, Isa.get_chunk_size(EC_ISA_ADDRESS_ALIGNMENT * k - 1));
+    ASSERT_EQ(EC_ISA_ADDRESS_ALIGNMENT * 2, Isa.get_chunk_size(EC_ISA_ADDRESS_ALIGNMENT * k + 1));
+  }
+  {
+    ErasureCodeIsaDefault Isa(tcache);
+    map<std::string, std::string> parameters;
+    parameters["k"] = "3";
+    parameters["m"] = "1";
+    Isa.init(parameters);
+    int k = 3;
+
+    ASSERT_EQ(EC_ISA_ADDRESS_ALIGNMENT, Isa.get_chunk_size(1));
+    ASSERT_EQ(EC_ISA_ADDRESS_ALIGNMENT, Isa.get_chunk_size(EC_ISA_ADDRESS_ALIGNMENT * k - 1));
+    ASSERT_EQ(EC_ISA_ADDRESS_ALIGNMENT * 2, Isa.get_chunk_size(EC_ISA_ADDRESS_ALIGNMENT * k + 1));
+    int object_size = EC_ISA_ADDRESS_ALIGNMENT * k * 1024 + 1;
+    ASSERT_NE(0, object_size % k);
+    ASSERT_NE(0, object_size % EC_ISA_ADDRESS_ALIGNMENT);
+    int chunk_size = Isa.get_chunk_size(object_size);
+    ASSERT_EQ(0, chunk_size % EC_ISA_ADDRESS_ALIGNMENT);
+    ASSERT_GT(chunk_size, (chunk_size * k) - object_size);
+  }
+}
+
+TEST_F(IsaErasureCodeTest, encode)
 {
   ErasureCodeIsaDefault Isa(tcache);
   map<std::string, std::string> parameters;
@@ -295,46 +325,44 @@ TEST(IsaErasureCodeTest, encode)
   parameters["m"] = "2";
   Isa.init(parameters);
 
-  unsigned alignment = Isa.get_alignment();
+  unsigned aligned_object_size = Isa.get_alignment() * 2;
   {
     //
     // When the input bufferlist needs to be padded because
     // it is not properly aligned, it is padded with zeros.
     //
     bufferlist in;
-    map<int, bufferlist> encoded;
-    int want_to_encode[] = {0, 1, 2, 3};
-    int trail_length = 2;
-    in.append(string(alignment + trail_length, 'X'));
-    EXPECT_EQ(0, Isa.encode(set<int>(want_to_encode, want_to_encode + 4),
-                            in,
-                            &encoded));
+    map<int,bufferlist> encoded;
+    int want_to_encode[] = { 0, 1, 2, 3 };
+    int trail_length = 1;
+    in.append(string(aligned_object_size + trail_length, 'X'));
+    EXPECT_EQ(0, Isa.encode(set<int>(want_to_encode, want_to_encode+4),
+				 in,
+				 &encoded));
     EXPECT_EQ(4u, encoded.size());
-    for (int i = 0; i < 4; i++)
-      EXPECT_EQ(alignment, encoded[i].length());
     char *last_chunk = encoded[1].c_str();
+    int length =encoded[1].length();
     EXPECT_EQ('X', last_chunk[0]);
-    EXPECT_EQ('\0', last_chunk[trail_length]);
+    EXPECT_EQ('\0', last_chunk[length - trail_length]);
   }
 
   {
     //
     // When only the first chunk is required, the encoded map only
-    // contains the first chunk. Although the encode
+    // contains the first chunk. Although the Isa encode
     // internally allocated a buffer because of padding requirements
     // and also computes the coding chunks, they are released before
     // the return of the method, as shown when running the tests thru
     // valgrind (there is no leak).
     //
     bufferlist in;
-    map<int, bufferlist> encoded;
+    map<int,bufferlist> encoded;
     set<int> want_to_encode;
     want_to_encode.insert(0);
-    int trail_length = 2;
-    in.append(string(alignment + trail_length, 'X'));
+    int trail_length = 1;
+    in.append(string(aligned_object_size + trail_length, 'X'));
     EXPECT_EQ(0, Isa.encode(want_to_encode, in, &encoded));
     EXPECT_EQ(1u, encoded.size());
-    EXPECT_EQ(alignment, encoded[0].length());
   }
 }
 
@@ -351,18 +379,18 @@ DecodeAndVerify(ErasureCodeIsaDefault& Isa, map<int, bufferlist> &degraded, set<
 
   for (int i = 0; i < (int) decoded.size(); i++) {
     // compare all the buffers with their original
-    ok |= strncmp(decoded[i].c_str(), enc[i].c_str(), length);
+    ok |= memcmp(decoded[i].c_str(), enc[i].c_str(), length);
   }
 
   return ok;
 }
 
-TYPED_TEST(IsaErasureCodeTest, isa_vandermonde_exhaustive)
+TEST_F(IsaErasureCodeTest, isa_vandermonde_exhaustive)
 {
   // Test all possible failure scenarios and reconstruction cases for
   // a (12,4) configuration using the vandermonde matrix
 
-  TypeParam Isa(tcache);
+  ErasureCodeIsaDefault Isa(tcache);
   map<std::string, std::string> parameters;
   parameters["k"] = "12";
   parameters["m"] = "4";
@@ -422,7 +450,7 @@ TYPED_TEST(IsaErasureCodeTest, isa_vandermonde_exhaustive)
   unsigned length = encoded[0].length();
 
   for (int i = 0; i < k; i++) {
-    EXPECT_EQ(0, strncmp(encoded[i].c_str(), in.c_str() + (i * length), length));
+    EXPECT_EQ(0, memcmp(encoded[i].c_str(), in.c_str() + (i * length), length));
   }
 
   buffer::ptr enc[k + m];
@@ -438,12 +466,12 @@ TYPED_TEST(IsaErasureCodeTest, isa_vandermonde_exhaustive)
   }
 
   // loop through all possible loss scenarios
-  bool err = true;
   int cnt_cf = 0;
 
   for (int l1 = 0; l1 < (k + m); l1++) {
     map<int, bufferlist> degraded = encoded;
     set<int> want_to_decode;
+    bool err = true;
     degraded.erase(l1);
     want_to_decode.insert(l1);
     err = DecodeAndVerify(Isa, degraded, want_to_decode, enc, length);
@@ -483,11 +511,11 @@ TYPED_TEST(IsaErasureCodeTest, isa_vandermonde_exhaustive)
   EXPECT_EQ(2506, tcache.getDecodingTableCacheSize()); // 3 entries from (2,2) test and 2503 from (12,4)
 }
 
-TYPED_TEST(IsaErasureCodeTest, isa_cauchy_exhaustive)
+TEST_F(IsaErasureCodeTest, isa_cauchy_exhaustive)
 {
   // Test all possible failure scenarios and reconstruction cases for
   // a (12,4) configuration using the cauchy matrix
-  TypeParam Isa(tcache,ErasureCodeIsaDefault::kCauchy);
+  ErasureCodeIsaDefault Isa(tcache,ErasureCodeIsaDefault::kCauchy);
   map<std::string, std::string> parameters;
   parameters["k"] = "12";
   parameters["m"] = "4";
@@ -549,7 +577,7 @@ TYPED_TEST(IsaErasureCodeTest, isa_cauchy_exhaustive)
   unsigned length = encoded[0].length();
 
   for (int i = 0; i < k; i++) {
-    EXPECT_EQ(0, strncmp(encoded[i].c_str(), in.c_str() + (i * length), length));
+    EXPECT_EQ(0, memcmp(encoded[i].c_str(), in.c_str() + (i * length), length));
   }
 
   buffer::ptr enc[k + m];
@@ -565,12 +593,12 @@ TYPED_TEST(IsaErasureCodeTest, isa_cauchy_exhaustive)
   }
 
   // loop through all possible loss scenarios
-  bool err = true;
   int cnt_cf = 0;
 
   for (int l1 = 0; l1 < (k + m); l1++) {
     map<int, bufferlist> degraded = encoded;
     set<int> want_to_decode;
+    bool err = true;
     degraded.erase(l1);
     want_to_decode.insert(l1);
     err = DecodeAndVerify(Isa, degraded, want_to_decode, enc, length);
@@ -610,11 +638,11 @@ TYPED_TEST(IsaErasureCodeTest, isa_cauchy_exhaustive)
   EXPECT_EQ(2516, tcache.getDecodingTableCacheSize(ErasureCodeIsaDefault::kCauchy));
 }
 
-TYPED_TEST(IsaErasureCodeTest, isa_cauchy_cache_trash)
+TEST_F(IsaErasureCodeTest, isa_cauchy_cache_trash)
 {
   // Test all possible failure scenarios and reconstruction cases for
   // a (12,4) configuration using the cauchy matrix
-  TypeParam Isa(tcache,ErasureCodeIsaDefault::kCauchy);
+  ErasureCodeIsaDefault Isa(tcache,ErasureCodeIsaDefault::kCauchy);
   map<std::string, std::string> parameters;
   parameters["k"] = "16";
   parameters["m"] = "4";
@@ -676,7 +704,7 @@ TYPED_TEST(IsaErasureCodeTest, isa_cauchy_cache_trash)
   unsigned length = encoded[0].length();
 
   for (int i = 0; i < k; i++) {
-    EXPECT_EQ(0, strncmp(encoded[i].c_str(), in.c_str() + (i * length), length));
+    EXPECT_EQ(0, memcmp(encoded[i].c_str(), in.c_str() + (i * length), length));
   }
 
   buffer::ptr enc[k + m];
@@ -692,12 +720,12 @@ TYPED_TEST(IsaErasureCodeTest, isa_cauchy_cache_trash)
   }
 
   // loop through all possible loss scenarios
-  bool err = true;
   int cnt_cf = 0;
 
   for (int l1 = 0; l1 < (k + m); l1++) {
     map<int, bufferlist> degraded = encoded;
     set<int> want_to_decode;
+    bool err = true;
     degraded.erase(l1);
     want_to_decode.insert(l1);
     err = DecodeAndVerify(Isa, degraded, want_to_decode, enc, length);
@@ -737,12 +765,12 @@ TYPED_TEST(IsaErasureCodeTest, isa_cauchy_cache_trash)
   EXPECT_EQ(2516, tcache.getDecodingTableCacheSize(ErasureCodeIsaDefault::kCauchy));
 }
 
-TYPED_TEST(IsaErasureCodeTest, isa_xor_codec)
+TEST_F(IsaErasureCodeTest, isa_xor_codec)
 {
   // Test all possible failure scenarios and reconstruction cases for
   // a (4,1) RAID-5 like configuration 
 
-  TypeParam Isa(tcache);
+  ErasureCodeIsaDefault Isa(tcache);
   map<std::string, std::string> parameters;
   parameters["k"] = "4";
   parameters["m"] = "1";
@@ -802,7 +830,7 @@ TYPED_TEST(IsaErasureCodeTest, isa_xor_codec)
   unsigned length = encoded[0].length();
 
   for (int i = 0; i < k; i++) {
-    EXPECT_EQ(0, strncmp(encoded[i].c_str(), in.c_str() + (i * length), length));
+    EXPECT_EQ(0, memcmp(encoded[i].c_str(), in.c_str() + (i * length), length));
   }
 
   buffer::ptr enc[k + m];
@@ -818,12 +846,12 @@ TYPED_TEST(IsaErasureCodeTest, isa_xor_codec)
   }
 
   // loop through all possible loss scenarios
-  bool err = true;
   int cnt_cf = 0;
 
   for (int l1 = 0; l1 < (k + m); l1++) {
     map<int, bufferlist> degraded = encoded;
     set<int> want_to_decode;
+    bool err = true;
     degraded.erase(l1);
     want_to_decode.insert(l1);
     err = DecodeAndVerify(Isa, degraded, want_to_decode, enc, length);
@@ -835,7 +863,7 @@ TYPED_TEST(IsaErasureCodeTest, isa_xor_codec)
   EXPECT_EQ(5, cnt_cf);
 }
 
-TEST(IsaErasureCodeTest, create_ruleset)
+TEST_F(IsaErasureCodeTest, create_ruleset)
 {
   CrushWrapper *c = new CrushWrapper;
   c->create();
@@ -928,8 +956,7 @@ int main(int argc, char **argv)
 
 /*
  * Local Variables:
- * compile-command: "cd ../.. ; make -j4 &&
- *   make unittest_erasure_code_isa &&
+ * compile-command: "cd ../.. ; make -j4 unittest_erasure_code_isa &&
  *   libtool --mode=execute valgrind --tool=memcheck --leak-check=full \
  *      ./unittest_erasure_code_isa \
  *      --gtest_filter=*.* --log-to-stderr=true --debug-osd=20"

@@ -1,4 +1,4 @@
-libcommon_la_SOURCES = \
+libcommon_internal_la_SOURCES = \
 	ceph_ver.c \
 	common/DecayCounter.cc \
 	common/LogClient.cc \
@@ -38,7 +38,6 @@ libcommon_la_SOURCES = \
 	common/pipe.c \
 	common/ceph_argparse.cc \
 	common/ceph_context.cc \
-	common/buffer.cc \
 	common/types.cc \
 	common/code_environment.cc \
 	common/dout.cc \
@@ -72,10 +71,12 @@ libcommon_la_SOURCES = \
 	common/hobject.cc \
 	common/bloom_filter.cc \
 	common/linux_version.c \
-	common/module.c
+	common/module.c \
+	common/Readahead.cc \
+	common/Cycles.cc
 
-# these should go out of libcommon
-libcommon_la_SOURCES += \
+# these should go out of libcommon_internal
+libcommon_internal_la_SOURCES += \
 	mon/MonCap.cc \
 	mon/MonClient.cc \
 	mon/MonMap.cc \
@@ -85,7 +86,17 @@ libcommon_la_SOURCES += \
 	osd/HitSet.cc \
 	mds/MDSMap.cc \
 	mds/inode_backtrace.cc \
-	mds/mdstypes.cc 
+	mds/mdstypes.cc \
+	mds/flock.cc
+LIBCOMMON_DEPS += libcommon_internal.la
+noinst_LTLIBRARIES += libcommon_internal.la
+
+libcommon_api_la_SOURCES = \
+	common/buffer.cc
+if LINUX
+libcommon_api_la_CXXFLAGS = -fvisibility=hidden -fvisibility-inlines-hidden
+endif # LINUX
+noinst_LTLIBRARIES += libcommon_api.la
 
 # inject crc in common
 libcommon_crc_la_SOURCES = \
@@ -118,7 +129,9 @@ if LINUX
 LIBCOMMON_DEPS += -lrt
 endif # LINUX
 
-libcommon_la_LIBADD = $(LIBCOMMON_DEPS)
+libcommon_la_SOURCES =
+libcommon_la_LIBADD = $(LIBCOMMON_DEPS) libcommon_api.la
+noinst_LTLIBRARIES += libcommon.la
 
 noinst_HEADERS += \
 	common/BackTrace.h \
@@ -203,10 +216,11 @@ noinst_HEADERS += \
 	common/cmdparse.h \
 	common/hobject.h \
 	common/linux_version.h \
-	common/module.h
-
-noinst_LTLIBRARIES += libcommon.la
-
+	common/module.h \
+	common/Continuation.h \
+	common/Readahead.h \
+	common/Cycles.h \
+	common/Initialize.h
 
 libsecret_la_SOURCES = common/secret.c
 libsecret_la_LIBADD = $(KEYUTILS_LIB)

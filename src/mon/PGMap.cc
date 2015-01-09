@@ -379,17 +379,31 @@ void PGMap::update_pg(pg_t pgid, bufferlist& bl)
 {
   bufferlist::iterator p = bl.begin();
   ceph::unordered_map<pg_t,pg_stat_t>::iterator s = pg_stat.find(pgid);
-  if (s != pg_stat.end())
+  epoch_t old_lec = 0;
+  if (s != pg_stat.end()) {
+    old_lec = s->second.get_effective_last_epoch_clean();
     stat_pg_sub(pgid, s->second);
+  }
   pg_stat_t& r = pg_stat[pgid];
   ::decode(r, p);
   stat_pg_add(pgid, r);
+
+  epoch_t lec = r.get_effective_last_epoch_clean();
+  if (min_last_epoch_clean &&
+      (lec < min_last_epoch_clean ||  // we did
+       (lec > min_last_epoch_clean && // we might
+	old_lec == min_last_epoch_clean)
+       ))
+    min_last_epoch_clean = 0;
 }
 
 void PGMap::remove_pg(pg_t pgid)
 {
   ceph::unordered_map<pg_t,pg_stat_t>::iterator s = pg_stat.find(pgid);
   if (s != pg_stat.end()) {
+    if (min_last_epoch_clean &&
+	s->second.get_effective_last_epoch_clean() == min_last_epoch_clean)
+      min_last_epoch_clean = 0;
     stat_pg_sub(pgid, s->second);
     pg_stat.erase(s);
   }
@@ -399,14 +413,33 @@ void PGMap::update_osd(int osd, bufferlist& bl)
 {
   bufferlist::iterator p = bl.begin();
   ceph::unordered_map<int32_t,osd_stat_t>::iterator o = osd_stat.find(osd);
-  if (o != osd_stat.end())
+  epoch_t old_lec = 0;
+  if (o != osd_stat.end()) {
+    ceph::unordered_map<int32_t,epoch_t>::iterator i = osd_epochs.find(osd);
+    if (i != osd_epochs.end())
+      old_lec = i->second;
     stat_osd_sub(o->second);
+  }
   osd_stat_t& r = osd_stat[osd];
   ::decode(r, p);
   stat_osd_add(r);
 
   // adjust [near]full status
   register_nearfull_status(osd, r);
+
+  // epoch?
+  if (!p.end()) {
+    epoch_t e;
+    ::decode(e, p);
+
+    if (e < min_last_epoch_clean ||
+	(e > min_last_epoch_clean &&
+	 old_lec == min_last_epoch_clean))
+      min_last_epoch_clean = 0;
+  } else {
+    // WARNING: we are not refreshing min_last_epoch_clean!  must be old store
+    // or old mon running.
+  }
 }
 
 void PGMap::remove_osd(int osd)
@@ -422,12 +455,17 @@ void PGMap::remove_osd(int osd)
   }
 }
 
-void PGMap::stat_pg_add(const pg_t &pgid, const pg_stat_t &s)
+void PGMap::stat_pg_add(const pg_t &pgid, const pg_stat_t &s, bool sumonly)
 {
-  num_pg++;
-  num_pg_by_state[s.state]++;
   pg_pool_sum[pgid.pool()].add(s);
   pg_sum.add(s);
+
+  if (sumonly)
+    return;
+
+  num_pg++;
+  num_pg_by_state[s.state]++;
+
   if (s.state & PG_STATE_CREATING) {
     creating_pgs.insert(pgid);
     if (s.acting_primary >= 0)
@@ -440,24 +478,27 @@ void PGMap::stat_pg_add(const pg_t &pgid, const pg_stat_t &s)
   }
 }
 
-void PGMap::stat_pg_sub(const pg_t &pgid, const pg_stat_t &s)
+void PGMap::stat_pg_sub(const pg_t &pgid, const pg_stat_t &s, bool sumonly)
 {
-  num_pg--;
-  if (--num_pg_by_state[s.state] == 0)
-    num_pg_by_state.erase(s.state);
-
   pool_stat_t& ps = pg_pool_sum[pgid.pool()];
   ps.sub(s);
   if (ps.is_zero())
     pg_pool_sum.erase(pgid.pool());
-
   pg_sum.sub(s);
+
+  if (sumonly)
+    return;
+
+  num_pg--;
+  if (--num_pg_by_state[s.state] == 0)
+    num_pg_by_state.erase(s.state);
+
   if (s.state & PG_STATE_CREATING) {
     creating_pgs.erase(pgid);
     if (s.acting_primary >= 0) {
       creating_pgs_by_osd[s.acting_primary].erase(pgid);
       if (creating_pgs_by_osd[s.acting_primary].size() == 0)
-        creating_pgs_by_osd.erase(s.acting_primary);
+	creating_pgs_by_osd.erase(s.acting_primary);
     }
   }
 
@@ -882,10 +923,9 @@ void PGMap::print_osd_blocked_by_stats(std::ostream *ss) const
   (*ss) << tab;
 }
 
-void PGMap::recovery_summary(Formatter *f, ostream *out,
+void PGMap::recovery_summary(Formatter *f, list<string> *psl,
                              const pool_stat_t& delta_sum) const
 {
-  bool first = true;
   if (delta_sum.stats.sum.num_objects_degraded) {
     double pc = (double)delta_sum.stats.sum.num_objects_degraded /
       (double)delta_sum.stats.sum.num_object_copies * (double)100.0;
@@ -894,12 +934,13 @@ void PGMap::recovery_summary(Formatter *f, ostream *out,
     if (f) {
       f->dump_unsigned("degraded_objects", delta_sum.stats.sum.num_objects_degraded);
       f->dump_unsigned("degraded_total", delta_sum.stats.sum.num_object_copies);
-      f->dump_string("degraded_ratio", b);
+      f->dump_float("degraded_ratio", pc / 100.0);
     } else {
-      *out << delta_sum.stats.sum.num_objects_degraded
-	   << "/" << delta_sum.stats.sum.num_object_copies << " objects degraded (" << b << "%)";
+      ostringstream ss;
+      ss << delta_sum.stats.sum.num_objects_degraded
+	 << "/" << delta_sum.stats.sum.num_object_copies << " objects degraded (" << b << "%)";
+      psl->push_back(ss.str());
     }
-    first = false;
   }
   if (delta_sum.stats.sum.num_objects_misplaced) {
     double pc = (double)delta_sum.stats.sum.num_objects_misplaced /
@@ -909,14 +950,13 @@ void PGMap::recovery_summary(Formatter *f, ostream *out,
     if (f) {
       f->dump_unsigned("misplaced_objects", delta_sum.stats.sum.num_objects_misplaced);
       f->dump_unsigned("misplaced_total", delta_sum.stats.sum.num_object_copies);
-      f->dump_string("misplaced_ratio", b);
+      f->dump_float("misplaced_ratio", pc / 100.0);
     } else {
-      if (!first)
-	*out << "; ";
-      *out << delta_sum.stats.sum.num_objects_misplaced
-	   << "/" << delta_sum.stats.sum.num_object_copies << " objects misplaced (" << b << "%)";
+      ostringstream ss;
+      ss << delta_sum.stats.sum.num_objects_misplaced
+	 << "/" << delta_sum.stats.sum.num_object_copies << " objects misplaced (" << b << "%)";
+      psl->push_back(ss.str());
     }
-    first = false;
   }
   if (delta_sum.stats.sum.num_objects_unfound) {
     double pc = (double)delta_sum.stats.sum.num_objects_unfound /
@@ -926,12 +966,12 @@ void PGMap::recovery_summary(Formatter *f, ostream *out,
     if (f) {
       f->dump_unsigned("unfound_objects", delta_sum.stats.sum.num_objects_unfound);
       f->dump_unsigned("unfound_total", delta_sum.stats.sum.num_objects);
-      f->dump_string("unfound_ratio", b);
+      f->dump_float("unfound_ratio", pc / 100.0);
     } else {
-      if (!first)
-	*out << "; ";
-      *out << delta_sum.stats.sum.num_objects_unfound
-	   << "/" << delta_sum.stats.sum.num_objects << " unfound (" << b << "%)";
+      ostringstream ss;
+      ss << delta_sum.stats.sum.num_objects_unfound
+	 << "/" << delta_sum.stats.sum.num_objects << " unfound (" << b << "%)";
+      psl->push_back(ss.str());
     }
   }
 }
@@ -969,9 +1009,9 @@ void PGMap::overall_recovery_rate_summary(Formatter *f, ostream *out) const
   recovery_rate_summary(f, out, pg_sum_delta, stamp_delta);
 }
 
-void PGMap::overall_recovery_summary(Formatter *f, ostream *out) const
+void PGMap::overall_recovery_summary(Formatter *f, list<string> *psl) const
 {
-  recovery_summary(f, out, pg_sum);
+  recovery_summary(f, psl, pg_sum);
 }
 
 void PGMap::pool_recovery_rate_summary(Formatter *f, ostream *out,
@@ -987,14 +1027,14 @@ void PGMap::pool_recovery_rate_summary(Formatter *f, ostream *out,
   recovery_rate_summary(f, out, p->second.first, ts->second);
 }
 
-void PGMap::pool_recovery_summary(Formatter *f, ostream *out,
+void PGMap::pool_recovery_summary(Formatter *f, list<string> *psl,
                                   uint64_t poolid) const
 {
   ceph::unordered_map<uint64_t,pair<pool_stat_t,utime_t> >::const_iterator p =
     per_pool_sum_delta.find(poolid);
   if (p == per_pool_sum_delta.end())
     return;
-  recovery_summary(f, out, p->second.first);
+  recovery_summary(f, psl, p->second.first);
 }
 
 void PGMap::client_io_rate_summary(Formatter *f, ostream *out,
@@ -1203,16 +1243,18 @@ void PGMap::print_summary(Formatter *f, ostream *out) const
 	 << kb_t(osd_sum.kb) << " avail\n";
   }
 
-  std::stringstream ssr;
-  overall_recovery_summary(f, &ssr);
-  if (!f && ssr.str().length())
-    *out << "            " << ssr.str() << "\n";
-  ssr.clear();
-  ssr.str("");
+  list<string> sl;
+  overall_recovery_summary(f, &sl);
+  if (!f && !sl.empty()) {
+    for (list<string>::iterator p = sl.begin(); p != sl.end(); ++p)
+      *out << "            " << *p << "\n";
+  }
+  sl.clear();
 
   if (!f)
     *out << ss.str();   // pgs by state
 
+  ostringstream ssr;
   overall_recovery_rate_summary(f, &ssr);
   if (!f && ssr.str().length())
     *out << "recovery io " << ssr.str() << "\n";
@@ -1223,30 +1265,47 @@ void PGMap::print_summary(Formatter *f, ostream *out) const
   overall_client_io_rate_summary(f, &ssr);
   if (!f && ssr.str().length())
     *out << "  client io " << ssr.str() << "\n";
-
-
 }
 
-void PGMap::print_oneline_summary(ostream *out) const
+void PGMap::print_oneline_summary(Formatter *f, ostream *out) const
 {
   std::stringstream ss;
 
+  if (f)
+    f->open_array_section("num_pg_by_state");
   for (ceph::unordered_map<int,int>::const_iterator p = num_pg_by_state.begin();
        p != num_pg_by_state.end();
        ++p) {
+    if (f) {
+      f->open_object_section("state");
+      f->dump_string("name", pg_state_string(p->first));
+      f->dump_unsigned("num", p->second);
+      f->close_section();
+    }
     if (p != num_pg_by_state.begin())
       ss << ", ";
     ss << p->second << " " << pg_state_string(p->first);
   }
+  if (f)
+    f->close_section();
 
   string states = ss.str();
-  *out << "v" << version << ": "
-       << pg_stat.size() << " pgs: "
-       << states << "; "
-       << prettybyte_t(pg_sum.stats.sum.num_bytes) << " data, "
-       << kb_t(osd_sum.kb_used) << " used, "
-       << kb_t(osd_sum.kb_avail) << " / "
-       << kb_t(osd_sum.kb) << " avail";
+  if (out)
+    *out << "v" << version << ": "
+	 << pg_stat.size() << " pgs: "
+	 << states << "; "
+	 << prettybyte_t(pg_sum.stats.sum.num_bytes) << " data, "
+	 << kb_t(osd_sum.kb_used) << " used, "
+	 << kb_t(osd_sum.kb_avail) << " / "
+	 << kb_t(osd_sum.kb) << " avail";
+  if (f) {
+    f->dump_unsigned("version", version);
+    f->dump_unsigned("num_pgs", pg_stat.size());
+    f->dump_unsigned("num_bytes", pg_sum.stats.sum.num_bytes);
+    f->dump_unsigned("raw_bytes_used", osd_sum.kb_used << 10);
+    f->dump_unsigned("raw_bytes_avail", osd_sum.kb_avail << 10);
+    f->dump_unsigned("raw_bytes", osd_sum.kb << 10);
+  }
 
   // make non-negative; we can get negative values if osds send
   // uncommitted stats and then "go backward" or if they are just
@@ -1255,27 +1314,37 @@ void PGMap::print_oneline_summary(ostream *out) const
   pos_delta.floor(0);
   if (pos_delta.stats.sum.num_rd ||
       pos_delta.stats.sum.num_wr) {
-    *out << "; ";
+    if (out)
+      *out << "; ";
     if (pos_delta.stats.sum.num_rd) {
       int64_t rd = (pos_delta.stats.sum.num_rd_kb << 10) / (double)stamp_delta;
-      *out << pretty_si_t(rd) << "B/s rd, ";
+      if (out)
+	*out << pretty_si_t(rd) << "B/s rd, ";
+      if (f)
+	f->dump_unsigned("read_bytes_sec", rd);
     }
     if (pos_delta.stats.sum.num_wr) {
       int64_t wr = (pos_delta.stats.sum.num_wr_kb << 10) / (double)stamp_delta;
-      *out << pretty_si_t(wr) << "B/s wr, ";
+      if (out)
+	*out << pretty_si_t(wr) << "B/s wr, ";
+      if (f)
+	f->dump_unsigned("write_bytes_sec", wr);
     }
     int64_t iops = (pos_delta.stats.sum.num_rd + pos_delta.stats.sum.num_wr) / (double)stamp_delta;
-    *out << pretty_si_t(iops) << "op/s";
+    if (out)
+      *out << pretty_si_t(iops) << "op/s";
+    if (f)
+      f->dump_unsigned("io_sec", iops);
   }
 
+  list<string> sl;
+  overall_recovery_summary(f, &sl);
+  if (out)
+    for (list<string>::iterator p = sl.begin(); p != sl.end(); ++p)
+      *out << "; " << *p;
   std::stringstream ssr;
-  overall_recovery_summary(NULL, &ssr);
-  if (ssr.str().length())
-    *out << "; " << ssr.str();
-  ssr.clear();
-  ssr.str("");
-  overall_recovery_rate_summary(NULL, &ssr);
-  if (ssr.str().length())
+  overall_recovery_rate_summary(f, &ssr);
+  if (out && ssr.str().length())
     *out << "; " << ssr.str() << " recovering";
 }
 

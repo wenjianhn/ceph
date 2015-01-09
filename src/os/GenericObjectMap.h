@@ -220,7 +220,7 @@ class GenericObjectMap {
     KeyValueDB::Transaction t);
 
   /// Set leaf node for c and oid to the value of header
-  void set_header(const coll_t &cid, const ghobject_t &oid, _Header header,
+  void set_header(const coll_t &cid, const ghobject_t &oid, _Header &header,
     KeyValueDB::Transaction t);
 
   // Move all modify member function to "protect", in order to indicate these
@@ -274,6 +274,7 @@ class GenericObjectMap {
 
   static const string GHOBJECT_KEY_SEP_S;
   static const char GHOBJECT_KEY_SEP_C;
+  static const char GHOBJECT_KEY_ENDING;
 
 private:
   /// Implicit lock on Header->seq

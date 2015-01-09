@@ -42,6 +42,8 @@ using namespace std;
 
 #include "auth/KeyRing.h"
 
+#include "perfglue/heap_profiler.h"
+
 #include "include/assert.h"
 
 #define dout_subsys ceph_subsys_mds
@@ -92,6 +94,7 @@ int main(int argc, const char **argv)
   env_to_vec(args);
 
   global_init(NULL, args, CEPH_ENTITY_TYPE_MDS, CODE_ENVIRONMENT_DAEMON, 0);
+  ceph_heap_profiler_init();
 
   // mds specific args
   MDSMap::DaemonState shadow = MDSMap::STATE_NULL;
@@ -142,7 +145,13 @@ int main(int argc, const char **argv)
     usage();
   }
 
-  Messenger *messenger = Messenger::create(g_ceph_context,
+  if (g_conf->name.get_id().empty() || (g_conf->name.get_id()[0] >= '0' && g_conf->name.get_id()[0] <= '9')) {
+    derr << "deprecation warning: MDS id '" << g_conf->name
+      << "' is invalid and will be forbidden in a future version.  "
+      "MDS names may not start with a numeric digit." << dendl;
+  }
+
+  Messenger *messenger = Messenger::create(g_ceph_context, g_conf->ms_type,
 					   entity_name_t::MDS(-1), "mds",
 					   getpid());
   messenger->set_cluster_protocol(CEPH_MDS_PROTOCOL);
@@ -156,7 +165,8 @@ int main(int argc, const char **argv)
     CEPH_FEATURE_MDS_INLINE_DATA |
     CEPH_FEATURE_PGID64 |
     CEPH_FEATURE_MSG_AUTH |
-    CEPH_FEATURE_EXPORT_PEER;
+    CEPH_FEATURE_EXPORT_PEER |
+    CEPH_FEATURE_MDS_QUOTA;
   uint64_t required =
     CEPH_FEATURE_OSDREPLYMUX;
   messenger->set_default_policy(Messenger::Policy::lossy_client(supported, required));

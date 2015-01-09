@@ -73,7 +73,7 @@ public:
   vector<Step> ruleset_steps;
 
   ErasureCodeLrc() :
-    ruleset_root("default")
+    chunk_count(0), data_chunk_count(0), ruleset_root("default")
   {
     ruleset_steps.push_back(Step("chooseleaf", "host", 0));
   }
@@ -86,11 +86,6 @@ public:
   virtual int minimum_to_decode(const set<int> &want_to_read,
 				const set<int> &available,
 				set<int> *minimum);
-
-  int layer_minimum_to_decode(const Layer &layer,
-			      const set<int> &want,
-			      const set<int> &available,
-			      set<int> *minimum) const;
 
   virtual int create_ruleset(const string &name,
 			     CrushWrapper &crush,
@@ -105,8 +100,6 @@ public:
   }
 
   virtual unsigned int get_chunk_size(unsigned int object_size) const;
-
-  int layer_encode(const Layer &layer, vector<bufferlist> &chunks);
 
   virtual int encode_chunks(const set<int> &want_to_encode,
 			    map<int, bufferlist> *encoded);

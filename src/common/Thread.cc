@@ -51,7 +51,8 @@ void *Thread::entry_wrapper()
   int p = ceph_gettid(); // may return -ENOSYS on other platforms
   if (p > 0)
     pid = p;
-  if (ioprio_class >= 0 &&
+  if (pid &&
+      ioprio_class >= 0 &&
       ioprio_priority >= 0) {
     ceph_ioprio_set(IOPRIO_WHO_PROCESS,
 		    pid,
@@ -65,7 +66,7 @@ const pthread_t &Thread::get_thread_id()
   return thread_id;
 }
 
-bool Thread::is_started()
+bool Thread::is_started() const
 {
   return thread_id != 0;
 }

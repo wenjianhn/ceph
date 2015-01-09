@@ -90,12 +90,13 @@ inline ostream& operator<<(ostream& out, const FSSuperblock& sb)
 class FileStore : public JournalingObjectStore,
                   public md_config_obs_t
 {
-  static const uint32_t target_version = 3;
+  static const uint32_t target_version = 4;
 public:
   uint32_t get_target_version() {
     return target_version;
   }
 
+  bool need_journal() { return true; }
   int peek_journal_fsid(uuid_d *fsid);
 
   struct FSPerfTracker {
@@ -158,7 +159,6 @@ private:
   Mutex lock;
   bool force_sync;
   Cond sync_cond;
-  uint64_t sync_epoch;
 
   Mutex sync_entry_timeo_lock;
   SafeTimer timer;
@@ -376,7 +376,6 @@ private:
   void op_queue_release_throttle(Op *o);
   void _journaled_ahead(OpSequencer *osr, Op *o, Context *ondisk);
   friend struct C_JournaledAhead;
-  int write_version_stamp();
 
   int open_journal();
 
@@ -409,8 +408,6 @@ public:
   int _sanity_check_fs();
   
   bool test_mount_in_use();
-  int version_stamp_is_valid(uint32_t *version);
-  int update_version_stamp();
   int read_op_seq(uint64_t *seq);
   int write_op_seq(int, uint64_t seq);
   int mount();
@@ -426,6 +423,11 @@ public:
   }
   int mkfs();
   int mkjournal();
+
+  int write_version_stamp();
+  int version_stamp_is_valid(uint32_t *version);
+  int update_version_stamp();
+  int upgrade();
 
   /**
    * set_allow_sharded_objects()
@@ -522,12 +524,13 @@ public:
     uint64_t offset,
     size_t len,
     bufferlist& bl,
+    uint32_t op_flags = 0,
     bool allow_eio = false);
   int fiemap(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferlist& bl);
 
   int _touch(coll_t cid, const ghobject_t& oid);
-  int _write(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, const bufferlist& bl,
-      bool replica = false);
+  int _write(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len,
+	      const bufferlist& bl, uint32_t fadvise_flags = 0);
   int _zero(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len);
   int _truncate(coll_t cid, const ghobject_t& oid, uint64_t size);
   int _clone(coll_t cid, const ghobject_t& oldoid, const ghobject_t& newoid,
@@ -592,8 +595,6 @@ public:
   int _collection_setattrs(coll_t cid, map<string,bufferptr> &aset);
   int _collection_remove_recursive(const coll_t &cid,
 				   const SequencerPosition &spos);
-  int _collection_rename(const coll_t &cid, const coll_t &ncid,
-			 const SequencerPosition& spos);
 
   // collections
   int list_collections(vector<coll_t>& ls);
@@ -686,7 +687,7 @@ private:
   double m_filestore_max_sync_interval;
   double m_filestore_min_sync_interval;
   bool m_filestore_fail_eio;
-  bool m_filestore_replica_fadvise;
+  bool m_filestore_fadvise;
   int do_update;
   bool m_journal_dio, m_journal_aio, m_journal_force_aio;
   std::string m_osd_rollback_to_cluster_snap;
