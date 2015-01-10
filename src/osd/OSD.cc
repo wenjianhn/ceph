@@ -5895,7 +5895,7 @@ void OSD::sched_scrub()
 
       PG *pg = _lookup_lock_pg(pgid);
       if (pg) {
-	if (pg->get_pgbackend()->scrub_supported() && pg->is_active() &&
+	if (pg->get_pgbackend()->scrub_supported() && pg->is_peered() &&
 	    (load_is_low ||
 	     (double)diff >= cct->_conf->osd_scrub_max_interval ||
 	     pg->scrubber.must_scrub)) {
@@ -7790,7 +7790,7 @@ void OSD::do_recovery(PG *pg, ThreadPool::TPHandle &handle)
     return;
   } else {
     pg->lock_suspend_timeout(handle);
-    if (pg->deleting || !(pg->is_active() && pg->is_primary())) {
+    if (pg->deleting || !(pg->is_peered() && pg->is_primary())) {
       pg->unlock();
       goto out;
     }
@@ -8388,8 +8388,11 @@ void OSD::process_peering_events(
       continue;
     }
     if (!advance_pg(curmap->get_epoch(), pg, handle, &rctx, &split_pgs)) {
-      pg->queue_null(curmap->get_epoch(), curmap->get_epoch());
-    } else if (!pg->peering_queue.empty()) {
+      // we need to requeue the PG explicitly since we didn't actually
+      // handle an event
+      peering_wq.queue(pg);
+    } else {
+      assert(!pg->peering_queue.empty());
       PG::CephPeeringEvtRef evt = pg->peering_queue.front();
       pg->peering_queue.pop_front();
       pg->handle_peering_event(evt, &rctx);
