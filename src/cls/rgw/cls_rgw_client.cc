@@ -44,7 +44,10 @@ void BucketIndexAioManager::do_completion(int id) {
   Mutex::Locker l(lock);
 
   map<int, librados::AioCompletion*>::iterator iter = pendings.find(id);
-  assert(iter != pendings.end());
+  if (iter == pendings.end()) {
+    /* were called twice for the same id */
+    return;
+  }
   completions.push_back(iter->second);
   pendings.erase(iter);
 
